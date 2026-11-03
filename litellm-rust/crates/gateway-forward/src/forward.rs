@@ -1,21 +1,25 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use axum::{
-    Router,
     body::Body,
-    extract::{ConnectInfo, DefaultBodyLimit, Request, State},
+    extract::Request,
     http::{StatusCode, Uri},
-    response::Response,
-    serve::ListenerExt,
+    response::{IntoResponse, Response},
 };
+use hyper::body::{Frame, Incoming, SizeHint};
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioTimer},
 };
 use tokio::net::TcpListener;
-use tokio_util::sync::CancellationToken;
 
-use crate::{Rejection, Upstream, rewrite, websocket::Upgrades};
+use crate::{
+    Rejection, Upstream, connections::Connections, rewrite, server, server::ClientSocket, websocket,
+};
 
 // uvicorn sets no response header limit and Python copies every provider header into its
 // response, so hyper's default of 100 would turn ordinary responses into 502s.
@@ -25,12 +29,14 @@ const PYTHON_RESPONSE_HEADERS: usize = 1000;
 pub struct Forward {
     upstream: Uri,
     client: Client<HttpConnector, Body>,
-    upgrades: Upgrades,
+    connections: Connections,
+    keepalive: Duration,
 }
 
 impl Forward {
     /// `upstream_keepalive` is how long the upstream keeps an idle connection open. Pooled
-    /// connections are dropped well before that, so a request never lands on one it is closing.
+    /// connections are dropped well before that, so a request never lands on one it is closing,
+    /// and idle client connections are closed after it, as uvicorn did.
     pub fn new(upstream: &Upstream, upstream_keepalive: Duration) -> Self {
         let mut connector = HttpConnector::new();
         connector.set_nodelay(true);
@@ -38,19 +44,14 @@ impl Forward {
             .http1_max_headers(PYTHON_RESPONSE_HEADERS)
             .pool_timer(TokioTimer::new())
             .pool_idle_timeout(upstream_keepalive / 2)
+            .set_host(false)
             .build(connector);
         Self {
             upstream: upstream.uri().clone(),
             client,
-            upgrades: Upgrades::default(),
+            connections: Connections::default(),
+            keepalive: upstream_keepalive,
         }
-    }
-
-    pub fn router(self) -> Router {
-        Router::new()
-            .fallback(forward)
-            .layer(DefaultBodyLimit::disable())
-            .with_state(self)
     }
 
     /// Serves until `shutdown` resolves, then lets open requests and WebSockets finish for up to
@@ -59,70 +60,87 @@ impl Forward {
     pub async fn serve(
         self,
         listener: TcpListener,
-        shutdown: impl Future<Output = ()> + Send + 'static,
+        shutdown: impl Future<Output = ()>,
         drain: Duration,
-    ) -> std::io::Result<()> {
-        let upgrades = self.upgrades.clone();
-        let _close_on_drop = upgrades.close_on_drop();
-        let stopping = CancellationToken::new();
-        let stop = stopping.clone();
-        let draining = upgrades.clone();
-        let listener = listener.tap_io(|stream| {
-            if let Err(error) = stream.set_nodelay(true) {
-                tracing::warn!(%error, "could not disable Nagle on a client connection");
-            }
-        });
-        let server = axum::serve(
-            listener,
-            self.router()
-                .into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
-            shutdown.await;
-            draining.begin_shutdown();
-            stop.cancel();
-        });
-        let drained = async {
-            let result = server.await;
-            if result.is_err() {
-                upgrades.close();
-            }
-            upgrades.wait().await;
-            result
-        };
-        let deadline = async {
-            stopping.cancelled().await;
-            tokio::time::sleep(drain).await;
-            tracing::warn!(
-                ?drain,
-                "closing connections still open after the shutdown drain"
-            );
-        };
-        let result = tokio::select! {
-            result = drained => result,
-            () = deadline => Ok(()),
-        };
-        upgrades.close();
-        upgrades.wait().await;
-        result
+    ) {
+        server::serve(self, listener, shutdown, drain).await;
+    }
+
+    pub(crate) fn connections(&self) -> &Connections {
+        &self.connections
+    }
+
+    pub(crate) fn keepalive(&self) -> Duration {
+        self.keepalive
+    }
+
+    pub(crate) async fn handle(&self, client: ClientSocket, request: Request) -> Response {
+        self.forward(client, request)
+            .await
+            .unwrap_or_else(IntoResponse::into_response)
+    }
+
+    async fn forward(
+        &self,
+        client: ClientSocket,
+        mut request: Request,
+    ) -> Result<Response, Rejection> {
+        let downstream = websocket::take_handshake(&self.connections, &mut request)?;
+        let request =
+            rewrite::upstream_request(request, &self.upstream, client, downstream.is_some())?;
+        let response = self.client.request(request);
+        let response = match downstream {
+            Some(_) => self
+                .connections
+                .until_closed(response)
+                .await
+                .ok_or(Rejection::ShuttingDown)?,
+            None => response.await,
+        }
+        .map_err(Rejection::from_upstream)?;
+        if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+            return websocket::switch(&self.connections, downstream, response).await;
+        }
+        Ok(rewrite::downstream_response(response)
+            .map(|body| Body::new(Relayed { body, failed: None })))
     }
 }
 
-async fn forward(
-    State(state): State<Forward>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    mut request: Request,
-) -> Result<Response, Rejection> {
-    let downstream = state.upgrades.take_handshake(&mut request)?;
-    let request = rewrite::upstream_request(request, &state.upstream, peer, downstream.is_some())?;
-    let response = state.client.request(request);
-    let response = match downstream {
-        Some(_) => state.upgrades.until_closed(response).await?,
-        None => response.await,
+/// Python's response body on its way to the client.
+struct Relayed {
+    body: Incoming,
+    failed: Option<hyper::Error>,
+}
+
+impl hyper::body::Body for Relayed {
+    type Data = <Incoming as hyper::body::Body>::Data;
+    type Error = hyper::Error;
+
+    // hyper aborts a client connection whose response body fails without flushing the head it
+    // buffered, so a head Python sent right before dying would never arrive and SDKs would retry
+    // a request Python already ran. Holding the error for one poll lets hyper flush the head.
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if let Some(error) = self.failed.take() {
+            return Poll::Ready(Some(Err(error)));
+        }
+        match Pin::new(&mut self.body).poll_frame(context) {
+            Poll::Ready(Some(Err(error))) => {
+                self.failed = Some(error);
+                context.waker().wake_by_ref();
+                Poll::Pending
+            }
+            frame => frame,
+        }
     }
-    .map_err(Rejection::Unreachable)?;
-    if response.status() == StatusCode::SWITCHING_PROTOCOLS {
-        return state.upgrades.switch(downstream, response).await;
+
+    fn is_end_stream(&self) -> bool {
+        self.failed.is_none() && self.body.is_end_stream()
     }
-    Ok(rewrite::downstream_response(response).map(Body::new))
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
 }

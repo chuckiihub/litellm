@@ -1,6 +1,13 @@
 mod support;
 
-use std::convert::Infallible;
+use std::{
+    convert::Infallible,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     Router,
@@ -11,8 +18,11 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use rstest::rstest;
-use support::{Gateway, client, recording, serve, within};
-use tokio::sync::mpsc;
+use support::{Gateway, Raw, client, raw_upstream, recording, serve, within};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{Notify, mpsc},
+};
 
 fn ok() -> Response {
     Response::new(Body::from("ok"))
@@ -89,4 +99,192 @@ async fn forwards_a_chunked_body_on_any_method(#[case] method: &str) {
         StatusCode::OK
     );
     assert_eq!(received.recv().await.unwrap().body, "body");
+}
+
+#[rstest]
+#[case::no_framing("", "", &[], "")]
+#[case::empty_content_length("content-length: 0\r\n", "", &[("content-length", "0")], "")]
+#[case::empty_chunked(
+    "transfer-encoding: chunked\r\n",
+    "0\r\n\r\n",
+    &[("transfer-encoding", "chunked")],
+    ""
+)]
+#[case::sized(
+    "content-length: 7\r\n",
+    "payload",
+    &[("content-length", "7")],
+    "payload"
+)]
+#[tokio::test]
+async fn a_body_reaches_python_with_the_framing_the_client_chose(
+    #[case] framing: &str,
+    #[case] wire_body: &str,
+    #[case] python_framing: &[(&str, &str)],
+    #[case] python_body: &str,
+) {
+    let (upstream, mut received) = recording(ok).await;
+    let gateway = Gateway::start(upstream).await;
+    let mut raw = gateway.connect().await;
+    raw.send(format!(
+        "POST /v1/files HTTP/1.1\r\nhost: x\r\n{framing}\r\n{wire_body}"
+    ))
+    .await;
+    assert_eq!(
+        within(raw.response_head()).await.unwrap().status,
+        StatusCode::OK
+    );
+
+    let request = received.recv().await.unwrap();
+    let forwarded: Vec<(&str, &str)> = ["content-length", "transfer-encoding"]
+        .into_iter()
+        .flat_map(|name| {
+            request
+                .headers
+                .get_all(name)
+                .iter()
+                .map(move |value| (name, value.to_str().unwrap()))
+        })
+        .collect();
+    assert_eq!(forwarded, python_framing);
+    assert_eq!(request.body, python_body);
+}
+
+#[rstest]
+#[tokio::test]
+async fn a_large_upload_is_paced_by_python_reading_it() {
+    const LENGTH: usize = 128 * 1024 * 1024;
+    let start_reading = Arc::new(Notify::new());
+    let reading = start_reading.clone();
+    let upstream = raw_upstream(move |mut python| {
+        let reading = reading.clone();
+        async move {
+            let head = python.request_head().await.unwrap();
+            reading.notified().await;
+            let mut remaining = head.content_length().unwrap();
+            while remaining > 0 {
+                remaining -= python.body(remaining.min(1 << 20)).await.len();
+            }
+            python
+                .send("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await;
+        }
+    })
+    .await;
+    let gateway = Gateway::start(upstream).await;
+    let (read, mut write) = gateway.connect().await.into_stream().into_split();
+    let sent = Arc::new(AtomicUsize::new(0));
+    let sending = sent.clone();
+    let upload = tokio::spawn(async move {
+        write
+            .write_all(
+                format!("POST /v1/files HTTP/1.1\r\nhost: x\r\ncontent-length: {LENGTH}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let chunk = [0x5a; 64 * 1024];
+        while sending.load(Ordering::SeqCst) < LENGTH {
+            write.write_all(&chunk).await.unwrap();
+            sending.fetch_add(chunk.len(), Ordering::SeqCst);
+        }
+        write
+    });
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        sent.load(Ordering::SeqCst) < LENGTH / 4,
+        "the forwarder buffered an upload Python was not reading"
+    );
+    start_reading.notify_one();
+    let write = tokio::time::timeout(Duration::from_secs(60), upload)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut raw = Raw::new(read.reunite(write).unwrap());
+    assert_eq!(
+        within(raw.response_head()).await.unwrap().status,
+        StatusCode::OK
+    );
+}
+
+#[rstest]
+#[case::between_chunks("5\r\nhello\r\n")]
+#[case::mid_chunk("100\r\nhello")]
+#[tokio::test]
+async fn a_client_abandoning_a_chunked_upload_never_ends_python_body_cleanly(
+    #[case] sent: &'static str,
+) {
+    let (forwarded, mut received) = mpsc::unbounded_channel();
+    let upstream = raw_upstream(move |mut python| {
+        let forwarded = forwarded.clone();
+        async move {
+            python.request_head().await.unwrap();
+            forwarded.send(python.until_closed().await).unwrap();
+        }
+    })
+    .await;
+    let gateway = Gateway::start(upstream).await;
+    let mut raw = gateway.connect().await;
+    raw.send(format!(
+        "POST /v1/files HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\n\r\n{sent}"
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(raw);
+
+    let body = within(received.recv()).await.unwrap();
+    assert!(body.starts_with(b"5\r\nhello\r\n"));
+    assert!(
+        !body.ends_with(b"0\r\n\r\n"),
+        "python saw a truncated upload end cleanly"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn an_early_answer_during_an_upload_keeps_both_connections_in_sync() {
+    let (event, mut events) = mpsc::unbounded_channel();
+    let upstream = raw_upstream(move |mut python| {
+        let event = event.clone();
+        async move {
+            while let Some(head) = python.request_head().await {
+                let length = head.content_length();
+                event.send(head.path.into_bytes()).unwrap();
+                let Some(length) = length else {
+                    python
+                        .send("HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nnext")
+                        .await;
+                    continue;
+                };
+                python
+                    .send("HTTP/1.1 413 Payload Too Large\r\ncontent-length: 2\r\n\r\n{}")
+                    .await;
+                event.send(python.body(length).await).unwrap();
+            }
+        }
+    })
+    .await;
+    let gateway = Gateway::start(upstream).await;
+    let upload = b"GET /smuggled HTTP/1.1\r\nhost: x\r\n\r\n".repeat(1024);
+    let (first_half, second_half) = upload.split_at(upload.len() / 2);
+    let mut raw = gateway.connect().await;
+    raw.send(format!(
+        "POST /v1/files HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n\r\n",
+        upload.len()
+    ))
+    .await;
+    raw.send(first_half).await;
+
+    let rejected = within(raw.response_head()).await.unwrap();
+    assert_eq!(rejected.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(raw.body(2).await, b"{}");
+    raw.send(second_half).await;
+    raw.send("GET /next HTTP/1.1\r\nhost: x\r\n\r\n").await;
+    let next = within(raw.response_head()).await.unwrap();
+    assert_eq!(raw.body(next.content_length().unwrap()).await, b"next");
+
+    assert_eq!(within(events.recv()).await.unwrap(), b"/v1/files");
+    assert_eq!(within(events.recv()).await.unwrap(), upload);
+    assert_eq!(within(events.recv()).await.unwrap(), b"/next");
 }

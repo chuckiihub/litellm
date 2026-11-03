@@ -9,94 +9,74 @@ use hyper::{
     upgrade::{OnUpgrade, Upgraded},
 };
 use hyper_util::rt::TokioIo;
-use tokio_util::{
-    sync::{CancellationToken, DropGuard},
-    task::TaskTracker,
-};
+use tokio::io::AsyncWriteExt;
 
-use crate::{Rejection, rewrite};
+use crate::{Rejection, connections::Connections, rewrite};
 
-#[derive(Clone, Default)]
-pub(crate) struct Upgrades {
-    tasks: TaskTracker,
-    draining: CancellationToken,
-    closed: CancellationToken,
+pub(crate) fn take_handshake(
+    connections: &Connections,
+    request: &mut Request,
+) -> Result<Option<OnUpgrade>, Rejection> {
+    if request.method() != Method::GET
+        || request.version() != Version::HTTP_11
+        || !rewrite::is_websocket_handshake(request.headers())
+    {
+        return Ok(None);
+    }
+    if connections.is_draining() {
+        return Err(Rejection::ShuttingDown);
+    }
+    Ok(Some(hyper::upgrade::on(request)))
 }
 
-impl Upgrades {
-    pub fn begin_shutdown(&self) {
-        self.draining.cancel();
+pub(crate) async fn switch(
+    connections: &Connections,
+    downstream: Option<OnUpgrade>,
+    mut response: Response<Incoming>,
+) -> Result<Response, Rejection> {
+    let Some(downstream) = downstream else {
+        return Err(Rejection::UnrequestedUpgrade);
+    };
+    if !rewrite::is_websocket_handshake(response.headers()) {
+        return Err(Rejection::UnrequestedUpgrade);
     }
+    let upstream = connections
+        .until_closed(hyper::upgrade::on(&mut response))
+        .await
+        .ok_or(Rejection::ShuttingDown)?
+        .map_err(Rejection::UpgradeFailed)?;
+    connections.spawn(async move {
+        match downstream.await {
+            Ok(downstream) => relay(downstream, upstream).await,
+            Err(_) => tracing::debug!("websocket upgrade did not complete"),
+        }
+    });
+    Ok(rewrite::switched_response(response).map(|_| Body::empty()))
+}
 
-    pub fn take_handshake(&self, request: &mut Request) -> Result<Option<OnUpgrade>, Rejection> {
-        if request.method() != Method::GET
-            || request.version() != Version::HTTP_11
-            || !rewrite::is_websocket_handshake(request.headers())
+// uvicorn never half-closes a WebSocket, so Python's EOF means the socket is gone and the relay
+// ends. The client's EOF only half-closes Python's side, since Python may still send its close
+// frame.
+async fn relay(downstream: Upgraded, upstream: Upgraded) {
+    let (mut client_read, mut client_write) = tokio::io::split(TokioIo::new(downstream));
+    let (mut python_read, mut python_write) = tokio::io::split(TokioIo::new(upstream));
+    let to_python = async {
+        if tokio::io::copy(&mut client_read, &mut python_write)
+            .await
+            .is_ok()
         {
-            return Ok(None);
+            python_write.shutdown().await.ok();
+            std::future::pending::<()>().await;
         }
-        if self.draining.is_cancelled() {
-            return Err(Rejection::ShuttingDown);
-        }
-        Ok(Some(hyper::upgrade::on(request)))
-    }
-
-    pub async fn until_closed<T>(&self, future: impl Future<Output = T>) -> Result<T, Rejection> {
-        tokio::select! {
-            _ = self.closed.cancelled() => Err(Rejection::ShuttingDown),
-            output = future => Ok(output),
-        }
-    }
-
-    pub async fn switch(
-        &self,
-        downstream: Option<OnUpgrade>,
-        mut response: Response<Incoming>,
-    ) -> Result<Response, Rejection> {
-        let Some(downstream) = downstream else {
-            return Err(Rejection::UnrequestedUpgrade);
-        };
-        if !rewrite::is_websocket_handshake(response.headers()) {
-            return Err(Rejection::UnrequestedUpgrade);
-        }
-        let upstream = self
-            .until_closed(hyper::upgrade::on(&mut response))
-            .await?
-            .map_err(Rejection::UpgradeFailed)?;
-        self.relay(downstream, upstream);
-        Ok(rewrite::switched_response(response).map(|_| Body::empty()))
-    }
-
-    pub fn close(&self) {
-        self.closed.cancel();
-    }
-
-    pub fn close_on_drop(&self) -> DropGuard {
-        self.closed.clone().drop_guard()
-    }
-
-    pub async fn wait(&self) {
-        self.tasks.close();
-        self.tasks.wait().await;
-    }
-
-    fn relay(&self, downstream: OnUpgrade, upstream: Upgraded) {
-        let closed = self.closed.clone();
-        self.tasks.spawn(async move {
-            tokio::select! {
-                _ = closed.cancelled() => {}
-                _ = async {
-                    let Ok(downstream) = downstream.await else {
-                        tracing::debug!("websocket upgrade did not complete");
-                        return;
-                    };
-                    let mut downstream = TokioIo::new(downstream);
-                    let mut upstream = TokioIo::new(upstream);
-                    if let Err(error) = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await {
-                        tracing::debug!(%error, "websocket relay disconnected");
-                    }
-                } => {}
-            }
-        });
+    };
+    let to_client = async {
+        tokio::io::copy(&mut python_read, &mut client_write)
+            .await
+            .ok();
+        client_write.shutdown().await.ok();
+    };
+    tokio::select! {
+        () = to_python => tracing::debug!("websocket client disconnected"),
+        () = to_client => {}
     }
 }

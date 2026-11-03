@@ -1,6 +1,12 @@
 mod support;
 
-use std::sync::Arc;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{body::Body, extract::Request, http::StatusCode, response::Response};
 use http_body_util::BodyExt;
@@ -77,4 +83,44 @@ async fn range_requests_and_partial_content_pass_unchanged() {
     let request = received.recv().await.unwrap();
     assert_eq!(request.headers["range"], "bytes=2-5");
     assert_eq!(request.headers["if-range"], "\"v1\"");
+}
+
+#[rstest]
+#[tokio::test]
+async fn a_large_download_is_paced_by_the_client_and_keeps_its_content_length() {
+    const LENGTH: usize = 128 * 1024 * 1024;
+    let written = Arc::new(AtomicUsize::new(0));
+    let writing = written.clone();
+    let upstream = raw_upstream(move |mut python| {
+        let writing = writing.clone();
+        async move {
+            python.request_head().await.unwrap();
+            python
+                .send(format!("HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {LENGTH}\r\n\r\n"))
+                .await;
+            let chunk = [0xa5; 64 * 1024];
+            while writing.load(Ordering::SeqCst) < LENGTH {
+                python.send(chunk).await;
+                writing.fetch_add(chunk.len(), Ordering::SeqCst);
+            }
+        }
+    })
+    .await;
+    let gateway = Gateway::start(upstream).await;
+    let mut raw = gateway.connect().await;
+    raw.send("GET /v1/files/file-1/content HTTP/1.1\r\nhost: x\r\n\r\n")
+        .await;
+
+    let head = within(raw.response_head()).await.unwrap();
+    assert_eq!(head.content_length(), Some(LENGTH));
+    assert_eq!(head.header("transfer-encoding"), None);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        written.load(Ordering::SeqCst) < LENGTH / 4,
+        "the forwarder buffered a download the client was not reading"
+    );
+    let mut remaining = LENGTH;
+    while remaining > 0 {
+        remaining -= within(raw.body(remaining.min(1 << 20))).await.len();
+    }
 }

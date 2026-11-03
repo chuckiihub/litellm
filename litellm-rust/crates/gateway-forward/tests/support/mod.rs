@@ -14,7 +14,7 @@ use axum::{
 use http_body_util::BodyExt;
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
-    rt::TokioExecutor,
+    rt::{TokioExecutor, TokioIo},
 };
 use litellm_gateway_forward::Forward;
 use tokio::{
@@ -36,7 +36,7 @@ pub async fn within<T>(future: impl Future<Output = T>) -> T {
 pub struct Gateway {
     pub address: SocketAddr,
     stop: oneshot::Sender<()>,
-    server: JoinHandle<std::io::Result<()>>,
+    server: JoinHandle<()>,
 }
 
 impl Gateway {
@@ -75,7 +75,7 @@ impl Gateway {
 
     /// Starts graceful shutdown and returns the server task, which ends once in-flight work drains
     /// or `DRAIN` passes.
-    pub fn shutdown(self) -> JoinHandle<std::io::Result<()>> {
+    pub fn shutdown(self) -> JoinHandle<()> {
         self.stop.send(()).unwrap();
         self.server
     }
@@ -83,6 +83,17 @@ impl Gateway {
 
 pub fn client() -> Client<HttpConnector, Body> {
     Client::builder(TokioExecutor::new()).build_http()
+}
+
+/// An HTTP/2 prior-knowledge client connection to `gateway`.
+pub async fn h2(gateway: &Gateway) -> hyper::client::conn::http2::SendRequest<Body> {
+    let stream = TcpStream::connect(gateway.address).await.unwrap();
+    let (sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .unwrap();
+    tokio::spawn(connection);
+    sender
 }
 
 /// What the upstream received, after the forwarder rewrote it.
@@ -288,6 +299,12 @@ impl Raw {
         let read = self.stream.read(&mut chunk).await.unwrap_or(0);
         self.buffer.extend_from_slice(&chunk[..read]);
         read
+    }
+
+    /// Everything the peer sends until it closes, including bytes already buffered.
+    pub async fn until_closed(&mut self) -> Vec<u8> {
+        while self.fill().await != 0 {}
+        std::mem::take(&mut self.buffer)
     }
 
     /// Resolves once the peer closes the connection, discarding anything it still sends.

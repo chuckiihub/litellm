@@ -24,6 +24,14 @@ pub enum Error {
 pub(crate) enum Rejection {
     #[error("request authority is not a valid Host header")]
     InvalidAuthority,
+    #[error("HTTP/1.1 request without a Host header")]
+    MissingHost,
+    #[error("request target has no path to forward")]
+    NoPath,
+    #[error("request uses a transfer coding other than chunked")]
+    UnsupportedTransferCoding,
+    #[error("client request body failed: {0}")]
+    ClientBody(#[source] hyper_util::client::legacy::Error),
     #[error("python proxy unreachable: {0}")]
     Unreachable(#[source] hyper_util::client::legacy::Error),
     #[error("python proxy switched protocols without being asked to")]
@@ -37,9 +45,24 @@ pub(crate) enum Rejection {
 }
 
 impl Rejection {
+    /// A client body that ends early or breaks its framing fails the upstream request too, but
+    /// the fault is the client's, not Python's.
+    pub fn from_upstream(error: hyper_util::client::legacy::Error) -> Self {
+        let client_body = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<hyper::Error>())
+            .is_some_and(hyper::Error::is_user);
+        match client_body {
+            true => Self::ClientBody(error),
+            false => Self::Unreachable(error),
+        }
+    }
+
     fn status(&self) -> StatusCode {
         match self {
-            Self::InvalidAuthority => StatusCode::BAD_REQUEST,
+            Self::InvalidAuthority | Self::MissingHost | Self::NoPath | Self::ClientBody(_) => {
+                StatusCode::BAD_REQUEST
+            }
+            Self::UnsupportedTransferCoding => StatusCode::NOT_IMPLEMENTED,
             Self::Unreachable(_) | Self::UnrequestedUpgrade | Self::UpgradeFailed(_) => {
                 StatusCode::BAD_GATEWAY
             }
@@ -47,14 +70,24 @@ impl Rejection {
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
+
+    fn is_gateway_fault(&self) -> bool {
+        matches!(
+            self,
+            Self::Unreachable(_)
+                | Self::UnrequestedUpgrade
+                | Self::UpgradeFailed(_)
+                | Self::Internal
+        )
+    }
 }
 
 impl IntoResponse for Rejection {
     fn into_response(self) -> Response {
-        let status = self.status();
-        if status.is_server_error() {
-            tracing::warn!(error = %self, "request not forwarded");
+        match self.is_gateway_fault() {
+            true => tracing::warn!(error = %self, "request not forwarded"),
+            false => tracing::debug!(error = %self, "request not forwarded"),
         }
-        status.into_response()
+        self.status().into_response()
     }
 }

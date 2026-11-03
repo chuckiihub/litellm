@@ -1,12 +1,10 @@
-use std::net::SocketAddr;
-
 use axum::{
     body::HttpBody,
     extract::Request,
     http::{HeaderMap, HeaderValue, Response, Uri, Version, header},
 };
 
-use crate::Rejection;
+use crate::{Rejection, server::ClientSocket};
 
 pub const PEER_HEADER: &str = "x-litellm-rust-peer";
 
@@ -16,19 +14,28 @@ pub const PEER_HEADER: &str = "x-litellm-rust-peer";
 pub(crate) fn upstream_request(
     mut request: Request,
     upstream: &Uri,
-    peer: SocketAddr,
+    client: ClientSocket,
     websocket: bool,
 ) -> Result<Request, Rejection> {
-    // HTTP/2 carries the public host in :authority, which retargeting at the upstream replaces.
-    if let Some(authority) = request.uri().authority()
-        && !request.headers().contains_key(header::HOST)
-    {
-        let host =
-            HeaderValue::from_str(authority.as_str()).map_err(|_| Rejection::InvalidAuthority)?;
-        request.headers_mut().insert(header::HOST, host);
+    if !only_chunked(request.headers()) {
+        return Err(Rejection::UnsupportedTransferCoding);
+    }
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .cloned()
+        .ok_or(Rejection::NoPath)?;
+    let version = request.version();
+    let host = public_host(&request, client)?;
+    let headers = request.headers_mut();
+    if let Some(host) = host {
+        headers.insert(header::HOST, host);
+    }
+    if version == Version::HTTP_2 {
+        join_cookie_crumbs(headers);
     }
     let mut uri = upstream.clone().into_parts();
-    uri.path_and_query = request.uri().path_and_query().cloned();
+    uri.path_and_query = Some(path_and_query);
     *request.uri_mut() = Uri::from_parts(uri).map_err(|_| Rejection::Internal)?;
     *request.version_mut() = Version::HTTP_11;
     let chunked = request.body().size_hint().exact().is_none();
@@ -46,9 +53,60 @@ pub(crate) fn upstream_request(
     }
     headers.insert(
         PEER_HEADER,
-        HeaderValue::from_str(&peer.to_string()).map_err(|_| Rejection::Internal)?,
+        HeaderValue::from_str(&client.peer.to_string()).map_err(|_| Rejection::Internal)?,
     );
     Ok(request)
+}
+
+// Python builds absolute URLs from Host and, without a usable one, from the address it listens
+// on, which behind Rust is the private loopback port. HTTP/2 carries the host in :authority, which
+// retargeting at the upstream replaces, and a client that sent no usable Host gets the public
+// address it connected to, which is what Python used before. h11 rejects HTTP/1.1 without Host.
+fn public_host(request: &Request, client: ClientSocket) -> Result<Option<HeaderValue>, Rejection> {
+    let host = request.headers().get(header::HOST);
+    if host.is_some_and(|host| !host.is_empty()) {
+        return Ok(None);
+    }
+    if let Some(authority) = request.uri().authority()
+        && request.version() == Version::HTTP_2
+    {
+        return HeaderValue::from_str(authority.as_str())
+            .map(Some)
+            .map_err(|_| Rejection::InvalidAuthority);
+    }
+    if host.is_none() && request.version() == Version::HTTP_11 {
+        return Err(Rejection::MissingHost);
+    }
+    HeaderValue::from_str(&client.local.to_string())
+        .map(Some)
+        .map_err(|_| Rejection::Internal)
+}
+
+// RFC 9113 section 8.2.3: HTTP/2 may split Cookie into one field per cookie, and they must be
+// joined back into one before the request crosses to HTTP/1.1.
+fn join_cookie_crumbs(headers: &mut HeaderMap) {
+    let crumbs: Vec<_> = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .map(HeaderValue::as_bytes)
+        .collect();
+    if crumbs.len() < 2 {
+        return;
+    }
+    let Ok(cookie) = HeaderValue::from_bytes(&crumbs.join(&b"; "[..])) else {
+        return;
+    };
+    headers.insert(header::COOKIE, cookie);
+}
+
+// hyper only decodes chunked framing, and uvicorn rejects any other transfer coding with a 501,
+// so anything else would reach Python still coded but framed as a plain body.
+fn only_chunked(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::TRANSFER_ENCODING)
+        .iter()
+        .flat_map(|value| value.as_bytes().split(|byte| *byte == b','))
+        .all(|coding| coding.trim_ascii().eq_ignore_ascii_case(b"chunked"))
 }
 
 /// The response the client receives: Python's, without the upstream connection's own headers.

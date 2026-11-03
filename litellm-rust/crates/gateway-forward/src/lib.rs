@@ -1,6 +1,8 @@
+mod connections;
 mod error;
 mod forward;
 mod rewrite;
+mod server;
 mod settings;
 mod websocket;
 
@@ -21,6 +23,6 @@ pub async fn run(
     tracing::info!(address = %listener.local_addr()?, "forwarding gateway listening");
     forward
         .serve(listener, shutdown, settings.shutdown_drain)
-        .await?;
+        .await;
     Ok(())
 }
