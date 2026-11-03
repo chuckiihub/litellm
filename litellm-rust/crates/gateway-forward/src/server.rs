@@ -8,7 +8,7 @@ use hyper_util::{
 };
 use tokio::net::TcpListener;
 
-use crate::Forward;
+use crate::{Forward, forward::MAX_HEADERS};
 
 /// The client's TCP connection to the public listener.
 #[derive(Clone, Copy, Debug)]
@@ -105,6 +105,7 @@ fn builder(keepalive: Duration) -> auto::Builder<TokioExecutor> {
     let mut builder = auto::Builder::new(TokioExecutor::new());
     builder
         .http1()
+        .max_headers(MAX_HEADERS)
         .timer(TokioTimer::new())
         .header_read_timeout(keepalive);
     builder

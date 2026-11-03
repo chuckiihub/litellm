@@ -59,10 +59,11 @@ impl Rejection {
 
     fn status(&self) -> StatusCode {
         match self {
-            Self::InvalidAuthority | Self::MissingHost | Self::NoPath | Self::ClientBody(_) => {
-                StatusCode::BAD_REQUEST
-            }
-            Self::UnsupportedTransferCoding => StatusCode::NOT_IMPLEMENTED,
+            Self::InvalidAuthority
+            | Self::MissingHost
+            | Self::NoPath
+            | Self::UnsupportedTransferCoding
+            | Self::ClientBody(_) => StatusCode::BAD_REQUEST,
             Self::Unreachable(_) | Self::UnrequestedUpgrade | Self::UpgradeFailed(_) => {
                 StatusCode::BAD_GATEWAY
             }

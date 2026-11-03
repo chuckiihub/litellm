@@ -18,17 +18,19 @@ use hyper_util::{
 use tokio::net::TcpListener;
 
 use crate::{
-    Rejection, Upstream, connections::Connections, rewrite, server, server::ClientSocket, websocket,
+    Rejection, Upstream, connections::Connections, connector::Connector, expect, rewrite, server,
+    server::ClientSocket, websocket,
 };
 
-// uvicorn sets no response header limit and Python copies every provider header into its
-// response, so hyper's default of 100 would turn ordinary responses into 502s.
-const PYTHON_RESPONSE_HEADERS: usize = 1000;
+// h11 counts no headers and only caps a head at 16 KiB, so it accepts as many headers as fit in
+// that many shortest lines (`a:\r\n`). Python copies every provider header into its response
+// too, so hyper's default of 100 would turn ordinary traffic into 431s and 502s.
+pub(crate) const MAX_HEADERS: usize = 16 * 1024 / b"a:\r\n".len();
 
 #[derive(Clone)]
 pub struct Forward {
     upstream: Uri,
-    client: Client<HttpConnector, Body>,
+    client: Client<Connector, Body>,
     connections: Connections,
     keepalive: Duration,
 }
@@ -41,11 +43,11 @@ impl Forward {
         let mut connector = HttpConnector::new();
         connector.set_nodelay(true);
         let client = Client::builder(TokioExecutor::new())
-            .http1_max_headers(PYTHON_RESPONSE_HEADERS)
+            .http1_max_headers(MAX_HEADERS)
             .pool_timer(TokioTimer::new())
             .pool_idle_timeout(upstream_keepalive / 2)
             .set_host(false)
-            .build(connector);
+            .build(Connector(connector));
         Self {
             upstream: upstream.uri().clone(),
             client,
@@ -86,6 +88,7 @@ impl Forward {
         mut request: Request,
     ) -> Result<Response, Rejection> {
         let downstream = websocket::take_handshake(&self.connections, &mut request)?;
+        let held_body = expect::hold_body_until_continue(&mut request);
         let request =
             rewrite::upstream_request(request, &self.upstream, client, downstream.is_some())?;
         let response = self.client.request(request);
@@ -98,6 +101,9 @@ impl Forward {
             None => response.await,
         }
         .map_err(Rejection::from_upstream)?;
+        if let Some(held_body) = held_body {
+            held_body.cancel();
+        }
         if response.status() == StatusCode::SWITCHING_PROTOCOLS {
             return websocket::switch(&self.connections, downstream, response).await;
         }

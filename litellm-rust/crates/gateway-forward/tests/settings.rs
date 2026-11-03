@@ -68,6 +68,7 @@ fn a_missing_variable_fails_naming_it(#[case] variable: &str) {
 #[case::port_text("LITELLM_FORWARD_PORT", "http")]
 #[case::keepalive_text("LITELLM_FORWARD_UPSTREAM_KEEPALIVE", "soon")]
 #[case::keepalive_negative("LITELLM_FORWARD_UPSTREAM_KEEPALIVE", "-1")]
+#[case::keepalive_zero("LITELLM_FORWARD_UPSTREAM_KEEPALIVE", "0")]
 #[case::drain_text("LITELLM_FORWARD_SHUTDOWN_DRAIN", "soon")]
 #[case::drain_negative("LITELLM_FORWARD_SHUTDOWN_DRAIN", "-1")]
 #[case::drain_infinite("LITELLM_FORWARD_SHUTDOWN_DRAIN", "inf")]

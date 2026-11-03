@@ -9,7 +9,7 @@ use hyper::{
     upgrade::{OnUpgrade, Upgraded},
 };
 use hyper_util::rt::TokioIo;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{Rejection, connections::Connections, rewrite};
 
@@ -55,19 +55,26 @@ pub(crate) async fn switch(
 }
 
 // uvicorn never half-closes a WebSocket, so Python's EOF means the socket is gone and the relay
-// ends. The client's EOF only half-closes Python's side, since Python may still send its close
-// frame.
+// ends. Only a client that is gone ends it from the other side: the client's EOF just half-closes
+// Python's side, and a write Python refuses means it closed with its last frames still in flight
+// to the client.
 async fn relay(downstream: Upgraded, upstream: Upgraded) {
     let (mut client_read, mut client_write) = tokio::io::split(TokioIo::new(downstream));
     let (mut python_read, mut python_write) = tokio::io::split(TokioIo::new(upstream));
     let to_python = async {
-        if tokio::io::copy(&mut client_read, &mut python_write)
-            .await
-            .is_ok()
-        {
-            python_write.shutdown().await.ok();
-            std::future::pending::<()>().await;
+        let mut buffer = vec![0; 8192];
+        loop {
+            let read = match client_read.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(_) => return,
+            };
+            if python_write.write_all(&buffer[..read]).await.is_err() {
+                return std::future::pending().await;
+            }
         }
+        python_write.shutdown().await.ok();
+        std::future::pending().await
     };
     let to_client = async {
         tokio::io::copy(&mut python_read, &mut client_write)

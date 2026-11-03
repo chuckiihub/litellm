@@ -80,7 +80,7 @@ impl Settings {
             upstream: environment.litellm_forward_upstream.parse()?,
             host: environment.litellm_forward_host,
             port: environment.litellm_forward_port,
-            upstream_keepalive: seconds(
+            upstream_keepalive: positive_seconds(
                 "LITELLM_FORWARD_UPSTREAM_KEEPALIVE",
                 environment.litellm_forward_upstream_keepalive,
             )?,
@@ -98,4 +98,15 @@ fn seconds(variable: &str, value: f64) -> Result<Duration, Error> {
             "{variable} must be a non-negative number of seconds, got {value}"
         ))
     })
+}
+
+/// The keep-alive also bounds the wait for a client's first request, so zero would close every
+/// client connection before it could send one.
+fn positive_seconds(variable: &str, value: f64) -> Result<Duration, Error> {
+    match seconds(variable, value)? {
+        Duration::ZERO => Err(Error::InvalidSetting(format!(
+            "{variable} must be a positive number of seconds, got {value}"
+        ))),
+        duration => Ok(duration),
+    }
 }
