@@ -1,10 +1,40 @@
-use std::{ffi::OsString, time::Duration};
+use std::{ffi::OsString, net::SocketAddr, str::FromStr, time::Duration};
 
+use axum::http::Uri;
 use serde::Deserialize;
 
 use crate::Error;
 
 const UPSTREAM: &str = "LITELLM_FORWARD_UPSTREAM";
+
+/// The Python proxy's private origin. Only a loopback IPv4 address parses, so nothing can point
+/// the forwarder at another host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upstream(Uri);
+
+impl Upstream {
+    pub(crate) fn uri(&self) -> &Uri {
+        &self.0
+    }
+}
+
+impl FromStr for Upstream {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self, Error> {
+        let uri: Uri = value.parse().map_err(Error::UpstreamUri)?;
+        let address = uri
+            .authority()
+            .filter(|_| uri.scheme_str() == Some("http"))
+            .filter(|authority| !authority.as_str().contains('@'))
+            .filter(|_| uri.path() == "/" && uri.query().is_none())
+            .and_then(|authority| authority.as_str().parse::<SocketAddr>().ok());
+        match address {
+            Some(SocketAddr::V4(address)) if address.ip().is_loopback() => Ok(Self(uri)),
+            _ => Err(Error::Upstream),
+        }
+    }
+}
 
 #[derive(Deserialize)]
 struct Environment {
@@ -19,7 +49,7 @@ struct Environment {
 /// Python actually runs with, so none of them is guessed or defaulted here.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
-    pub upstream: String,
+    pub upstream: Upstream,
     pub host: String,
     pub port: u16,
     pub upstream_keepalive: Duration,
@@ -47,7 +77,7 @@ impl Settings {
             envy::Error::Custom(message) => Error::InvalidSetting(message),
         })?;
         Ok(Some(Self {
-            upstream: environment.litellm_forward_upstream,
+            upstream: environment.litellm_forward_upstream.parse()?,
             host: environment.litellm_forward_host,
             port: environment.litellm_forward_port,
             upstream_keepalive: seconds(

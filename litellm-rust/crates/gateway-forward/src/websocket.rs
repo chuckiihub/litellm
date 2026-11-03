@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::Request,
-    http::{HeaderMap, Method, StatusCode, Version, header},
+    http::{Method, Version},
     response::Response,
 };
 use hyper::{
@@ -13,6 +13,8 @@ use tokio_util::{
     sync::{CancellationToken, DropGuard},
     task::TaskTracker,
 };
+
+use crate::{Rejection, rewrite};
 
 #[derive(Clone, Default)]
 pub(crate) struct Upgrades {
@@ -26,22 +28,22 @@ impl Upgrades {
         self.draining.cancel();
     }
 
-    pub fn take_handshake(&self, request: &mut Request) -> Result<Option<OnUpgrade>, StatusCode> {
+    pub fn take_handshake(&self, request: &mut Request) -> Result<Option<OnUpgrade>, Rejection> {
         if request.method() != Method::GET
             || request.version() != Version::HTTP_11
-            || !is_handshake(request.headers())
+            || !rewrite::is_websocket_handshake(request.headers())
         {
             return Ok(None);
         }
         if self.draining.is_cancelled() {
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
+            return Err(Rejection::ShuttingDown);
         }
         Ok(Some(hyper::upgrade::on(request)))
     }
 
-    pub async fn until_closed<T>(&self, future: impl Future<Output = T>) -> Result<T, StatusCode> {
+    pub async fn until_closed<T>(&self, future: impl Future<Output = T>) -> Result<T, Rejection> {
         tokio::select! {
-            _ = self.closed.cancelled() => Err(StatusCode::SERVICE_UNAVAILABLE),
+            _ = self.closed.cancelled() => Err(Rejection::ShuttingDown),
             output = future => Ok(output),
         }
     }
@@ -50,24 +52,19 @@ impl Upgrades {
         &self,
         downstream: Option<OnUpgrade>,
         mut response: Response<Incoming>,
-    ) -> Result<Response, StatusCode> {
+    ) -> Result<Response, Rejection> {
         let Some(downstream) = downstream else {
-            return Err(StatusCode::BAD_GATEWAY);
+            return Err(Rejection::UnrequestedUpgrade);
         };
-        if !is_handshake(response.headers()) {
-            return Err(StatusCode::BAD_GATEWAY);
+        if !rewrite::is_websocket_handshake(response.headers()) {
+            return Err(Rejection::UnrequestedUpgrade);
         }
         let upstream = self
             .until_closed(hyper::upgrade::on(&mut response))
             .await?
-            .map_err(|error| {
-                tracing::warn!(%error, "python proxy websocket upgrade failed");
-                StatusCode::BAD_GATEWAY
-            })?;
-        crate::hop::strip(response.headers_mut());
-        crate::hop::restore_websocket_handshake(response.headers_mut());
+            .map_err(Rejection::UpgradeFailed)?;
         self.relay(downstream, upstream);
-        Ok(response.map(|_| Body::empty()))
+        Ok(rewrite::switched_response(response).map(|_| Body::empty()))
     }
 
     pub fn close(&self) {
@@ -102,16 +99,4 @@ impl Upgrades {
             }
         });
     }
-}
-
-fn is_handshake(headers: &HeaderMap) -> bool {
-    headers
-        .get(header::UPGRADE)
-        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
-        && headers
-            .get_all(header::CONNECTION)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .flat_map(|value| value.split(','))
-            .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
 }

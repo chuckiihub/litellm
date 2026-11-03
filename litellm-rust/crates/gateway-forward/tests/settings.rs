@@ -38,7 +38,7 @@ fn reads_every_variable() {
     assert_eq!(
         parse(&COMPLETE).unwrap(),
         Some(Settings {
-            upstream: "http://127.0.0.1:53211".into(),
+            upstream: "http://127.0.0.1:53211".parse().unwrap(),
             host: "0.0.0.0".into(),
             port: 4000,
             upstream_keepalive: Duration::from_secs(2),
@@ -96,4 +96,14 @@ fn python_settings_are_never_read(#[case] variable: &str) {
     variables.push((variable, "9"));
 
     assert_eq!(parse(&variables).unwrap(), parse(&COMPLETE).unwrap());
+}
+
+#[rstest]
+fn a_non_loopback_upstream_fails_startup() {
+    let error = parse(&with("LITELLM_FORWARD_UPSTREAM", "http://192.0.2.1:4000")).unwrap_err();
+
+    assert!(
+        error.to_string().contains("LITELLM_FORWARD_UPSTREAM"),
+        "{error}"
+    );
 }

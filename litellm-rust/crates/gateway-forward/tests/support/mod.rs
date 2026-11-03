@@ -45,7 +45,7 @@ impl Gateway {
     }
 
     pub async fn with_keepalive(upstream: SocketAddr, keepalive: Duration) -> Self {
-        let forward = Forward::new(&format!("http://{upstream}"), keepalive).unwrap();
+        let forward = Forward::new(&format!("http://{upstream}").parse().unwrap(), keepalive);
         let public = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = public.local_addr().unwrap();
         let (stop, stopped) = oneshot::channel::<()>();

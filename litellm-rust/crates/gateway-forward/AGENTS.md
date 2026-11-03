@@ -10,6 +10,10 @@
 - Pooled upstream connections are retired well before Python's keep-alive timeout, so a request never lands on a connection Python is closing
 - WebSocket is the one protocol switch Python serves. Upgrades are relayed as raw bytes after the 101 and drained on shutdown
 
+## Layout
+
+Every forwarding decision has one home. `rewrite.rs` owns what Python and the client receive, as pure functions over requests and responses. `Rejection` in `error.rs` is the only place that picks a status for a request Rust answers itself. `settings.rs` parses the environment into typed values, so an `Upstream` is a loopback origin by construction. `forward.rs` and `websocket.rs` only move requests, bodies and upgraded connections and never touch a header themselves
+
 ## Environment
 
 `Settings` reads only these variables, and only when `LITELLM_FORWARD_UPSTREAM` is set. The Python supervisor in `litellm/proxy/rust_forward/` sets every one of them from the values Python actually runs with, so all of them are required and a missing or invalid one fails startup naming it. The crate never reads Python's own settings (`HOST`, `PORT`, `KEEPALIVE_TIMEOUT`, `GRACEFUL_SHUTDOWN_TIMEOUT`) and keeps no copy of Python's defaults, since Python can get those values from CLI flags the environment never shows

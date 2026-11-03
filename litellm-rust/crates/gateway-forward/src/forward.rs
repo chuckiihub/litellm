@@ -1,13 +1,10 @@
-use std::{
-    net::{Ipv4Addr, SocketAddr},
-    time::Duration,
-};
+use std::{net::SocketAddr, time::Duration};
 
 use axum::{
     Router,
-    body::{Body, HttpBody},
+    body::Body,
     extract::{ConnectInfo, DefaultBodyLimit, Request, State},
-    http::{HeaderValue, StatusCode, Uri, Version, header},
+    http::{StatusCode, Uri},
     response::Response,
     serve::ListenerExt,
 };
@@ -18,9 +15,7 @@ use hyper_util::{
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use crate::{Error, hop, websocket::Upgrades};
-
-pub const PEER_HEADER: &str = "x-litellm-rust-peer";
+use crate::{Rejection, Upstream, rewrite, websocket::Upgrades};
 
 // uvicorn sets no response header limit and Python copies every provider header into its
 // response, so hyper's default of 100 would turn ordinary responses into 502s.
@@ -36,21 +31,7 @@ pub struct Forward {
 impl Forward {
     /// `upstream_keepalive` is how long the upstream keeps an idle connection open. Pooled
     /// connections are dropped well before that, so a request never lands on one it is closing.
-    pub fn new(upstream: &str, upstream_keepalive: Duration) -> Result<Self, Error> {
-        let upstream: Uri = upstream.parse().map_err(Error::UpstreamUri)?;
-        if upstream.scheme_str() != Some("http")
-            || !upstream
-                .host()
-                .and_then(|host| host.parse::<Ipv4Addr>().ok())
-                .is_some_and(|ip| ip.is_loopback())
-            || upstream
-                .authority()
-                .is_some_and(|authority| authority.as_str().contains('@'))
-            || upstream.path() != "/"
-            || upstream.query().is_some()
-        {
-            return Err(Error::Upstream);
-        }
+    pub fn new(upstream: &Upstream, upstream_keepalive: Duration) -> Self {
         let mut connector = HttpConnector::new();
         connector.set_nodelay(true);
         let client = Client::builder(TokioExecutor::new())
@@ -58,11 +39,11 @@ impl Forward {
             .pool_timer(TokioTimer::new())
             .pool_idle_timeout(upstream_keepalive / 2)
             .build(connector);
-        Ok(Self {
-            upstream,
+        Self {
+            upstream: upstream.uri().clone(),
             client,
             upgrades: Upgrades::default(),
-        })
+        }
     }
 
     pub fn router(self) -> Router {
@@ -131,52 +112,17 @@ async fn forward(
     State(state): State<Forward>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     mut request: Request,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, Rejection> {
     let downstream = state.upgrades.take_handshake(&mut request)?;
-    // HTTP/2 carries the public host in :authority, which the upstream rewrite below replaces.
-    if let Some(authority) = request.uri().authority()
-        && !request.headers().contains_key(header::HOST)
-    {
-        let host =
-            HeaderValue::from_str(authority.as_str()).map_err(|_| StatusCode::BAD_REQUEST)?;
-        request.headers_mut().insert(header::HOST, host);
-    }
-    let mut uri = state.upstream.into_parts();
-    uri.path_and_query = request.uri().path_and_query().cloned();
-    *request.uri_mut() = Uri::from_parts(uri).map_err(|_| StatusCode::BAD_GATEWAY)?;
-    *request.version_mut() = Version::HTTP_11;
-    let chunked = request.body().size_hint().exact().is_none();
-    let headers = request.headers_mut();
-    hop::strip(headers);
-    if chunked {
-        // hyper sends no body for a GET with an unknown length unless told it is chunked.
-        headers.insert(
-            header::TRANSFER_ENCODING,
-            HeaderValue::from_static("chunked"),
-        );
-    }
-    if downstream.is_some() {
-        hop::restore_websocket_handshake(headers);
-    }
-    // Forwarding headers pass through untouched so Python sees the request as if the client
-    // connected to it directly. Inserting replaces any client-sent copy: the peer is the one
-    // value a client must not choose.
-    headers.insert(
-        PEER_HEADER,
-        HeaderValue::from_str(&peer.to_string()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-    );
+    let request = rewrite::upstream_request(request, &state.upstream, peer, downstream.is_some())?;
     let response = state.client.request(request);
-    let mut response = match downstream {
+    let response = match downstream {
         Some(_) => state.upgrades.until_closed(response).await?,
         None => response.await,
     }
-    .map_err(|error| {
-        tracing::warn!(%error, "python proxy unreachable");
-        StatusCode::BAD_GATEWAY
-    })?;
+    .map_err(Rejection::Unreachable)?;
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
         return state.upgrades.switch(downstream, response).await;
     }
-    hop::strip(response.headers_mut());
-    Ok(response.map(Body::new))
+    Ok(rewrite::downstream_response(response).map(Body::new))
 }

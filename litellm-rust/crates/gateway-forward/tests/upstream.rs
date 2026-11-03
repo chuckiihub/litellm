@@ -1,6 +1,4 @@
-use std::time::Duration;
-
-use litellm_gateway_forward::Forward;
+use litellm_gateway_forward::Upstream;
 use rstest::rstest;
 
 #[rstest]
@@ -12,12 +10,12 @@ use rstest::rstest;
 #[case::query("http://127.0.0.1:4000/?x=y")]
 #[case::credentials("http://user@127.0.0.1:4000")]
 fn rejects_anything_but_a_loopback_http_origin(#[case] upstream: &str) {
-    assert!(Forward::new(upstream, Duration::from_secs(5)).is_err());
+    assert!(upstream.parse::<Upstream>().is_err());
 }
 
 #[rstest]
 #[case::standard("http://127.0.0.1:4000")]
 #[case::loopback_range("http://127.0.0.2:4000/")]
 fn accepts_a_loopback_http_origin(#[case] upstream: &str) {
-    assert!(Forward::new(upstream, Duration::from_secs(5)).is_ok());
+    assert!(upstream.parse::<Upstream>().is_ok());
 }
