@@ -15,11 +15,34 @@ use axum::{
     http::{HeaderValue, StatusCode},
     response::Response,
 };
+use litellm_gateway_forward::PEER_HEADER;
 use rstest::rstest;
-use support::{Gateway, client, raw_upstream, recording, serve, within};
+use support::{Gateway, Head, client, raw_upstream, recording, serve, within};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::mpsc,
+};
 
 fn ok() -> Response {
     Response::new(Body::from("ok"))
+}
+
+/// An upstream that reports each bodiless request head exactly as it arrived on the wire.
+async fn heads() -> (std::net::SocketAddr, mpsc::UnboundedReceiver<Head>) {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let address = raw_upstream(move |mut python| {
+        let sender = sender.clone();
+        async move {
+            while let Some(head) = python.request_head().await {
+                sender.send(head).unwrap();
+                python
+                    .send("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+            }
+        }
+    })
+    .await;
+    (address, receiver)
 }
 
 #[rstest]
@@ -74,6 +97,9 @@ async fn forwards_the_request_as_the_client_sent_it_minus_hop_headers() {
 #[case::delete("DELETE")]
 #[case::options("OPTIONS")]
 #[case::extension("PURGE")]
+#[case::webdav("PROPFIND")]
+#[case::lowercase("get")]
+#[case::punctuated("M-SEARCH")]
 #[tokio::test]
 async fn forwards_every_method(#[case] method: &str) {
     let (upstream, mut received) = recording(ok).await;
@@ -128,6 +154,43 @@ async fn forwards_the_request_target_byte_for_byte(#[case] target: &str) {
 
 #[rstest]
 #[tokio::test]
+async fn forwards_a_query_string_as_long_as_uvicorn_accepts() {
+    let (upstream, mut received) = recording(ok).await;
+    let gateway = Gateway::start(upstream).await;
+    let mut raw = gateway.connect().await;
+    let target = format!("/vertex_ai/v1/models?key=%2F{}&end", "a%20b".repeat(3000));
+    raw.send(format!("GET {target} HTTP/1.1\r\nhost: x\r\n\r\n"))
+        .await;
+    assert_eq!(
+        within(raw.response_head()).await.unwrap().status,
+        StatusCode::OK
+    );
+    assert_eq!(received.recv().await.unwrap().uri, target.as_str());
+}
+
+/// h11 splits the target at the first `?` and keeps a `#` as ordinary bytes of the path or
+/// query, so a client that leaves `#` unescaped still reaches its route with every byte.
+#[rstest]
+#[case::in_query("/v1/files?purpose=batch#retry&limit=1")]
+#[case::in_path("/v1/files/report#1.pdf/content")]
+#[case::before_query("/gemini/v1beta/files/a#b?key=k")]
+#[ignore = "bug: http::Uri drops everything from `#`, so Python gets a truncated path or query"]
+#[tokio::test]
+async fn forwards_an_unescaped_hash_in_the_target(#[case] target: &str) {
+    let (upstream, mut received) = heads().await;
+    let gateway = Gateway::start(upstream).await;
+    let mut raw = gateway.connect().await;
+    raw.send(format!("GET {target} HTTP/1.1\r\nhost: x\r\n\r\n"))
+        .await;
+    assert_eq!(
+        within(raw.response_head()).await.unwrap().status,
+        StatusCode::OK
+    );
+    assert_eq!(within(received.recv()).await.unwrap().path, target);
+}
+
+#[rstest]
+#[tokio::test]
 async fn absolute_form_targets_reach_python_as_origin_form() {
     let (upstream, mut received) = recording(ok).await;
     let gateway = Gateway::start(upstream).await;
@@ -170,6 +233,138 @@ async fn relays_a_response_with_more_headers_than_hyper_allows_by_default() {
     assert_eq!(head.header("llm_provider-x-149"), Some(&b"v"[..]));
 }
 
+/// uvicorn's h11 parser has no header count limit, only a 16 KiB cap on the whole head.
+#[rstest]
+#[tokio::test]
+async fn forwards_a_request_with_as_many_headers_as_uvicorn_accepts() {
+    let (sender, mut received) = mpsc::unbounded_channel();
+    let upstream = raw_upstream(move |python| {
+        let sender = sender.clone();
+        async move {
+            let mut stream = python.into_stream();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(stream.read_u8().await.unwrap());
+            }
+            sender.send(head).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        }
+    })
+    .await;
+    let gateway = Gateway::start(upstream).await;
+    let mut raw = gateway.connect().await;
+    let headers: String = (0..1000).map(|index| format!("x-{index}: v\r\n")).collect();
+    raw.send(format!(
+        "GET /v1/chat/completions HTTP/1.1\r\nhost: x\r\n{headers}\r\n"
+    ))
+    .await;
+    assert_eq!(
+        within(raw.response_head()).await.unwrap().status,
+        StatusCode::OK
+    );
+    let head = String::from_utf8(within(received.recv()).await.unwrap()).unwrap();
+    assert!(head.contains(&headers));
+}
+
+async fn header_fields_python_receives(fields: &str) -> Vec<(String, Vec<u8>)> {
+    let (upstream, mut received) = heads().await;
+    let gateway = Gateway::start(upstream).await;
+    let mut raw = gateway.connect().await;
+    raw.send(format!(
+        "GET /anthropic/v1/messages HTTP/1.1\r\nhost: x\r\n{fields}\r\n"
+    ))
+    .await;
+    within(raw.response_head()).await.unwrap();
+    within(received.recv())
+        .await
+        .unwrap()
+        .headers
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("x-") && name != PEER_HEADER)
+        .collect()
+}
+
+fn fields(expected: &[(&str, &str)]) -> Vec<(String, Vec<u8>)> {
+    expected
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), value.as_bytes().to_vec()))
+        .collect()
+}
+
+/// Python reads `scope["headers"]` as the list the client sent, in that order.
+#[rstest]
+#[tokio::test]
+async fn dropping_a_hop_by_hop_header_keeps_the_others_in_order() {
+    let received = header_fields_python_receives(
+        "x-a: 1\r\nconnection: keep-alive\r\nx-b: 2\r\nx-c: 3\r\nx-d: 4\r\n",
+    )
+    .await;
+    assert_eq!(
+        received,
+        fields(&[("x-a", "1"), ("x-b", "2"), ("x-c", "3"), ("x-d", "4")])
+    );
+}
+
+#[rstest]
+#[ignore = "divergence: HeaderMap groups every value of a name at its first position"]
+#[tokio::test]
+async fn interleaved_repeated_headers_reach_python_interleaved() {
+    let received = header_fields_python_receives("x-a: 1\r\nx-b: 2\r\nx-a: 3\r\n").await;
+    assert_eq!(
+        received,
+        fields(&[("x-a", "1"), ("x-b", "2"), ("x-a", "3")])
+    );
+}
+
+/// h11 trims optional whitespace around a value and keeps everything inside it, including empty
+/// values and names using every token character.
+#[rstest]
+#[tokio::test]
+async fn python_sees_header_values_as_h11_would_parse_them() {
+    let (upstream, mut received) = recording(ok).await;
+    let gateway = Gateway::start(upstream).await;
+    let mut raw = gateway.connect().await;
+    raw.send("GET / HTTP/1.1\r\nhost: x\r\nx-empty:\r\nx-blank:   \r\nx-inner:  a \t b \t\r\nX-Token!#$%&'*+.^_`|~: v\r\nx-empty: second\r\n\r\n")
+        .await;
+    assert_eq!(
+        within(raw.response_head()).await.unwrap().status,
+        StatusCode::OK
+    );
+    let request = received.recv().await.unwrap();
+    let values = |name: &str| -> Vec<&[u8]> {
+        request
+            .headers
+            .get_all(name)
+            .iter()
+            .map(HeaderValue::as_bytes)
+            .collect()
+    };
+    assert_eq!(values("x-empty"), [&b""[..], b"second"]);
+    assert_eq!(values("x-blank"), [&b""[..]]);
+    assert_eq!(values("x-inner"), [&b"a \t b"[..]]);
+    assert_eq!(values("x-token!#$%&'*+.^_`|~"), [&b"v"[..]]);
+}
+
+/// RFC 9112 section 5.2 lets a server either reject obs-fold or unfold it, and h11 unfolds.
+#[rstest]
+#[ignore = "divergence: hyper rejects obs-fold with a 400 where uvicorn unfolds it to one space"]
+#[tokio::test]
+async fn a_folded_header_reaches_python_unfolded() {
+    let (upstream, mut received) = recording(ok).await;
+    let gateway = Gateway::start(upstream).await;
+    let mut raw = gateway.connect().await;
+    raw.send("GET / HTTP/1.1\r\nhost: x\r\nx-a: b\r\n c\r\n\r\n")
+        .await;
+    assert_eq!(
+        within(raw.response_head()).await.unwrap().status,
+        StatusCode::OK
+    );
+    assert_eq!(received.recv().await.unwrap().headers["x-a"], "b c");
+}
+
 #[rstest]
 #[tokio::test]
 async fn keeps_repeated_response_headers_and_opaque_header_bytes() {
@@ -199,6 +394,30 @@ async fn keeps_repeated_response_headers_and_opaque_header_bytes() {
         received.recv().await.unwrap().headers["x-opaque"].as_bytes(),
         b"caf\xe9"
     );
+}
+
+/// An HTTP/1.0 client cannot decode chunked framing, so a streamed answer reaches it delimited by
+/// the connection closing, as uvicorn sends it.
+#[rstest]
+#[tokio::test]
+async fn an_http10_client_gets_a_streamed_answer_unframed_and_python_gets_its_body() {
+    let (upstream, mut received) = recording(|| {
+        Response::new(Body::from_stream(futures_util::stream::iter(
+            ["str", "eamed"].map(|piece| Ok::<_, Infallible>(Bytes::from_static(piece.as_bytes()))),
+        )))
+    })
+    .await;
+    let gateway = Gateway::start(upstream).await;
+    let mut raw = gateway.connect().await;
+    raw.send("POST /v1/completions HTTP/1.0\r\nhost: x\r\ncontent-length: 7\r\n\r\npayload")
+        .await;
+    let head = within(raw.response_head()).await.unwrap();
+    assert_eq!(head.status, StatusCode::OK);
+    assert_eq!(head.header("transfer-encoding"), None);
+    assert_eq!(within(raw.until_closed()).await, b"streamed");
+    let request = received.recv().await.unwrap();
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.body, "payload");
 }
 
 #[rstest]

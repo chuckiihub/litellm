@@ -11,8 +11,8 @@ use std::{
 use axum::{body::Body, extract::Request, http::StatusCode, response::Response};
 use http_body_util::BodyExt;
 use rstest::rstest;
-use support::{Gateway, client, raw_upstream, recording, within};
-use tokio::sync::Notify;
+use support::{Gateway, client, h2, raw_upstream, recording, serve, within};
+use tokio::sync::{Notify, mpsc};
 
 #[rstest]
 #[tokio::test]
@@ -122,5 +122,110 @@ async fn a_large_download_is_paced_by_the_client_and_keeps_its_content_length() 
     let mut remaining = LENGTH;
     while remaining > 0 {
         remaining -= within(raw.body(remaining.min(1 << 20))).await.len();
+    }
+}
+
+/// The UI revalidates its static assets, and a 304 must carry exactly the validators Python sent,
+/// with no length invented for a body it never has.
+#[rstest]
+#[tokio::test]
+async fn a_conditional_request_gets_python_304_with_its_validators_only() {
+    let (event, mut events) = mpsc::unbounded_channel();
+    let upstream = raw_upstream(move |mut python| {
+        let event = event.clone();
+        async move {
+            while let Some(head) = python.request_head().await {
+                event
+                    .send(head.header("if-none-match").map(<[u8]>::to_vec))
+                    .unwrap();
+                python
+                    .send("HTTP/1.1 304 Not Modified\r\netag: \"5f1-abc\"\r\ncache-control: no-cache\r\nvary: Accept-Encoding\r\ndate: Tue, 03 Nov 2026 10:00:00 GMT\r\n\r\n")
+                    .await;
+            }
+        }
+    })
+    .await;
+    let gateway = Gateway::start(upstream).await;
+    let mut raw = gateway.connect().await;
+
+    for _ in 0..2 {
+        raw.send("GET /ui/_next/static/chunks/main.js HTTP/1.1\r\nhost: x\r\nif-none-match: \"5f1-abc\"\r\n\r\n")
+            .await;
+        let head = within(raw.response_head()).await.unwrap();
+        assert_eq!(head.status, StatusCode::NOT_MODIFIED);
+        let mut names: Vec<_> = head.headers.iter().map(|(name, _)| name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["cache-control", "date", "etag", "vary"]);
+        assert_eq!(head.header("etag"), Some(&b"\"5f1-abc\""[..]));
+        assert_eq!(
+            head.header("date"),
+            Some(&b"Tue, 03 Nov 2026 10:00:00 GMT"[..])
+        );
+        assert_eq!(
+            within(events.recv()).await.unwrap().as_deref(),
+            Some(&b"\"5f1-abc\""[..])
+        );
+    }
+}
+
+/// A client knows a download was cut short only because fewer bytes than the Content-Length
+/// arrived before the connection closed, so the length must survive and the connection must end.
+#[rstest]
+#[tokio::test]
+async fn a_download_python_cuts_short_closes_the_client_connection_before_its_length() {
+    let upstream = raw_upstream(|mut python| async move {
+        python.request_head().await.unwrap();
+        python
+            .send([&b"HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: 1000\r\n\r\n"[..], &[0xa5; 500]].concat())
+            .await;
+    })
+    .await;
+    let gateway = Gateway::start(upstream).await;
+    let mut raw = gateway.connect().await;
+    raw.send("GET /v1/files/file-1/content HTTP/1.1\r\nhost: x\r\n\r\n")
+        .await;
+
+    let head = within(raw.response_head()).await.unwrap();
+    assert_eq!(head.status, StatusCode::OK);
+    assert_eq!(head.content_length(), Some(1000));
+    assert_eq!(within(raw.until_closed()).await, [0xa5; 500]);
+}
+
+#[rstest]
+#[tokio::test]
+async fn http2_clients_download_concurrent_large_bodies_with_their_content_length() {
+    const LENGTH: usize = 1024 * 1024;
+    let upstream = serve(axum::Router::new().fallback(|request: Request| async move {
+        let index: u8 = request.uri().query().unwrap().parse().unwrap();
+        Response::builder()
+            .header("content-type", "application/octet-stream")
+            .body(Body::from(vec![index; LENGTH]))
+            .unwrap()
+    }))
+    .await;
+    let gateway = Gateway::start(upstream).await;
+    let sender = h2(&gateway).await;
+
+    let downloads: Vec<_> = (0..8u8)
+        .map(|index| {
+            let mut sender = sender.clone();
+            tokio::spawn(async move {
+                let request = Request::get(format!(
+                    "http://public.example/v1/files/file-{index}/content?{index}"
+                ))
+                .body(Body::empty())
+                .unwrap();
+                let response = sender.send_request(request).await.unwrap();
+                let length = response.headers()["content-length"].clone();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                (length, body)
+            })
+        })
+        .collect();
+
+    for (index, download) in downloads.into_iter().enumerate() {
+        let (length, body) = within(download).await.unwrap();
+        assert_eq!(length, LENGTH.to_string().as_str());
+        assert_eq!(body, vec![u8::try_from(index).unwrap(); LENGTH]);
     }
 }

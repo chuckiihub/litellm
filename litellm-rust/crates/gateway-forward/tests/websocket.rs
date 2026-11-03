@@ -2,6 +2,7 @@ mod support;
 
 use std::{
     net::SocketAddr,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -10,14 +11,14 @@ use axum::{
     http::{HeaderValue, StatusCode},
     response::IntoResponse,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, future::join_all};
 use litellm_gateway_forward::PEER_HEADER;
 use rstest::rstest;
 use support::{DRAIN, Gateway, Head, Raw, raw_upstream, serve, within};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::mpsc,
+    sync::{Barrier, mpsc},
 };
 use tokio_tungstenite::{
     WebSocketStream, accept_hdr_async, client_async,
@@ -126,13 +127,24 @@ async fn byte_echo(headers: &'static str) -> (SocketAddr, mpsc::UnboundedReceive
             let handshake = python.request_head().await.unwrap();
             python.send(switching(&handshake, headers)).await;
             sender.send(handshake).unwrap();
-            let mut stream = python.into_stream();
-            let (mut read, mut write) = stream.split();
-            tokio::io::copy(&mut read, &mut write).await.ok();
+            echo_bytes(python).await;
         }
     })
     .await;
     (upstream, handshakes)
+}
+
+async fn echo_bytes(python: Raw) {
+    let mut stream = python.into_stream();
+    let (mut read, mut write) = stream.split();
+    tokio::io::copy(&mut read, &mut write).await.ok();
+}
+
+async fn assert_echoes(socket: &mut TcpStream, message: &[u8]) {
+    socket.write_all(message).await.unwrap();
+    let mut echoed = vec![0; message.len()];
+    within(socket.read_exact(&mut echoed)).await.unwrap();
+    assert_eq!(echoed, message);
 }
 
 async fn open(gateway: &Gateway, handshake: String) -> (TcpStream, Head) {
@@ -500,4 +512,227 @@ async fn relay_ends_when_python_closes_while_the_client_holds_its_socket() {
     within(gateway.shutdown()).await.unwrap();
     assert!(started.elapsed() < DRAIN / 2);
     drop(socket);
+}
+
+/// uvicorn answers a handshake Python closes before accepting with a 403, and one Python denies
+/// through `websocket.http.response` with any status, headers and body, then drops the socket. The
+/// client gets that response whole and keeps a connection that still reaches Python.
+#[rstest]
+#[case::closed_before_accept("403 Forbidden", None, "")]
+#[case::denial_response(
+    "401 Unauthorized",
+    Some("Bearer realm=\"litellm\""),
+    "{\"error\":\"invalid api key\"}"
+)]
+#[tokio::test]
+async fn a_denied_handshake_reaches_the_client_whole(
+    #[case] status: &'static str,
+    #[case] authenticate: Option<&'static str>,
+    #[case] body: &'static str,
+) {
+    let upstream = raw_upstream(move |mut python: Raw| async move {
+        python.request_head().await.unwrap();
+        let authenticate = authenticate
+            .map(|value| format!("www-authenticate: {value}\r\n"))
+            .unwrap_or_default();
+        python
+            .send(format!(
+                "HTTP/1.1 {status}\r\ndate: Tue, 03 Nov 2026 08:00:00 GMT\r\nconnection: close\r\ncontent-length: {}\r\ncontent-type: text/plain; charset=utf-8\r\n{authenticate}\r\n{body}",
+                body.len()
+            ))
+            .await;
+    })
+    .await;
+    let gateway = Gateway::start(upstream).await;
+    let mut raw = gateway.connect().await;
+    for _ in 0..2 {
+        raw.send(handshake("/v1/realtime", "")).await;
+        let denied = within(raw.response_head()).await.unwrap();
+        assert_eq!(denied.status.as_str(), &status[..3]);
+        assert_eq!(
+            values(&denied, "www-authenticate"),
+            Vec::from_iter(authenticate.map(String::from))
+        );
+        assert!(denied.header("sec-websocket-accept").is_none());
+        let length = denied.content_length().unwrap();
+        assert_eq!(within(raw.body(length)).await, body.as_bytes());
+    }
+}
+
+/// Only Python's EOF ends a relay, so a client that half-closes after its close frame still gets
+/// everything Python sends before closing its own side.
+#[rstest]
+#[tokio::test]
+async fn a_client_half_close_still_receives_what_python_sends_after_it() {
+    let upstream = raw_upstream(|mut python: Raw| async move {
+        let handshake = python.request_head().await.unwrap();
+        python.send(switching(&handshake, "")).await;
+        let received = python.until_closed().await;
+        python.send(received).await;
+    })
+    .await;
+    let gateway = Gateway::start(upstream).await;
+    let (mut socket, _) = open(&gateway, handshake("/v1/realtime", "")).await;
+    let close = b"\x88\x82\x01\x02\x03\x04\x02\xea";
+    socket.write_all(close).await.unwrap();
+    socket.shutdown().await.unwrap();
+    let mut replied = Vec::new();
+    within(socket.read_to_end(&mut replied)).await.unwrap();
+    assert_eq!(replied, close);
+}
+
+/// Python authenticates every handshake before accepting it, so sessions opened together must all
+/// reach Python before any of them is accepted, and each must stay on its own socket.
+#[rstest]
+#[tokio::test]
+async fn opens_many_sockets_at_once_without_crossing_them() {
+    const SOCKETS: usize = 64;
+    let everyone = Arc::new(Barrier::new(SOCKETS));
+    let upstream = raw_upstream(move |mut python: Raw| {
+        let everyone = everyone.clone();
+        async move {
+            let handshake = python.request_head().await.unwrap();
+            everyone.wait().await;
+            python.send(switching(&handshake, "")).await;
+            echo_bytes(python).await;
+        }
+    })
+    .await;
+    let gateway = Gateway::start(upstream).await;
+    let gateway = &gateway;
+    within(join_all((0..SOCKETS).map(|index| async move {
+        let (mut socket, _) = open(gateway, handshake("/v1/realtime", "")).await;
+        assert_echoes(&mut socket, format!("socket {index}").as_bytes()).await;
+    })))
+    .await;
+}
+
+/// Python resolves the key, budget and model before it accepts, and nothing bounds how long that
+/// takes, so the idle timeout must not cut a handshake waiting on its 101.
+#[rstest]
+#[tokio::test]
+async fn waits_for_a_101_slower_than_the_keepalive() {
+    let upstream = raw_upstream(|mut python: Raw| async move {
+        let handshake = python.request_head().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        python.send(switching(&handshake, "")).await;
+        echo_bytes(python).await;
+    })
+    .await;
+    let gateway = Gateway::with_keepalive(upstream, Duration::from_millis(400)).await;
+    let (mut socket, _) = open(&gateway, handshake("/v1/realtime", "")).await;
+    assert_echoes(&mut socket, b"late").await;
+}
+
+/// A 101 the client did not ask for, or to a protocol other than the one it asked for, would hand
+/// the client a socket it cannot speak, so it is a 502 and Python's socket is closed.
+#[rstest]
+#[case::plain_request("GET /v1/models HTTP/1.1\r\nhost: x\r\n\r\n".to_owned(), "websocket")]
+#[case::other_protocol(handshake("/v1/realtime", ""), "h2c")]
+#[tokio::test]
+async fn an_unrequested_switch_is_a_502_that_closes_python(
+    #[case] request: String,
+    #[case] protocol: &'static str,
+) {
+    let (closed, mut closes) = mpsc::unbounded_channel();
+    let upstream = raw_upstream(move |mut python: Raw| {
+        let closed = closed.clone();
+        async move {
+            python.request_head().await.unwrap();
+            python
+                .send(format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: {protocol}\r\n\r\n"
+                ))
+                .await;
+            python.closed().await;
+            closed.send(()).unwrap();
+        }
+    })
+    .await;
+    let gateway = Gateway::start(upstream).await;
+    let mut raw = gateway.connect().await;
+    raw.send(request).await;
+    assert_eq!(
+        within(raw.response_head()).await.unwrap().status,
+        StatusCode::BAD_GATEWAY
+    );
+    within(closes.recv()).await.unwrap();
+}
+
+/// A realtime session streams audio for as long as the client reads it, so a client that stops
+/// reading must stall Python's writes instead of piling them up in the gateway.
+#[rstest]
+#[tokio::test]
+async fn a_client_that_stops_reading_stalls_python() {
+    let (sent, mut totals) = mpsc::unbounded_channel();
+    let upstream = raw_upstream(move |mut python: Raw| {
+        let sent = sent.clone();
+        async move {
+            let handshake = python.request_head().await.unwrap();
+            python.send(switching(&handshake, "")).await;
+            python.body(2).await;
+            let mut stream = python.into_stream();
+            let chunk = vec![0x82; 64 * 1024];
+            let mut total = 0;
+            while let Ok(Ok(())) =
+                tokio::time::timeout(Duration::from_millis(300), stream.write_all(&chunk)).await
+            {
+                total += chunk.len();
+            }
+            sent.send(total).unwrap();
+        }
+    })
+    .await;
+    let gateway = Gateway::start(upstream).await;
+    let (mut socket, _) = open(&gateway, handshake("/v1/realtime", "")).await;
+    socket.write_all(b"go").await.unwrap();
+    let total = within(totals.recv()).await.unwrap();
+    assert!(
+        total < 64 << 20,
+        "python wrote {total} bytes into a stalled socket"
+    );
+}
+
+/// Python closes a session that is still streaming audio by sending an error event and a close
+/// frame and dropping its socket with the client's next frames unread, which resets it. Those last
+/// bytes reached the client when it talked to uvicorn directly, so they must reach it through the
+/// relay too, even though writing the client's frames to Python now fails.
+#[rstest]
+#[tokio::test]
+async fn python_closing_mid_stream_still_delivers_its_last_frames() {
+    const LAST: &[u8] = b"\x81\x05error\x88\x02\x03\xf0";
+    let upstream = raw_upstream(|mut python: Raw| async move {
+        let handshake = python.request_head().await.unwrap();
+        python.send(switching(&handshake, "")).await;
+        python.body(1).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        python.send(LAST).await;
+    })
+    .await;
+    let gateway = Gateway::start(upstream).await;
+    for _ in 0..20 {
+        let (mut socket, _) = open(&gateway, handshake("/v1/realtime", "")).await;
+        let (mut read, mut write) = socket.split();
+        let streaming = async {
+            while write.write_all(b"\x82\x80\0\0\0\0").await.is_ok() {
+                tokio::time::sleep(Duration::from_micros(200)).await;
+            }
+            std::future::pending().await
+        };
+        let mut received = Vec::new();
+        let receiving = async {
+            let mut chunk = [0; 4096];
+            while let Ok(read @ 1..) = read.read(&mut chunk).await {
+                received.extend_from_slice(&chunk[..read]);
+            }
+        };
+        within(async {
+            tokio::select! {
+                () = streaming => {}
+                () = receiving => {}
+            }
+        })
+        .await;
+        assert_eq!(received, LAST);
+    }
 }

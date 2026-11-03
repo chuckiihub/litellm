@@ -509,3 +509,40 @@ async fn closes_an_http2_connection_whose_client_stops_answering_pings() {
 
     within(raw.until_closed()).await;
 }
+
+/// uvicorn answers a request it rejects (413, 401) as soon as it reads the head and then closes,
+/// leaving the upload unread. The client must get that answer, not a 502 or a reset.
+#[rstest]
+#[case::sized("content-length: 16777216\r\n", vec![b'x'; 256 * 1024])]
+#[case::chunked(
+    "transfer-encoding: chunked\r\n",
+    [&b"40000\r\n"[..], &[b'x'; 256 * 1024], b"\r\n"].concat()
+)]
+#[tokio::test]
+async fn python_rejecting_an_upload_unread_and_closing_still_answers_the_client(
+    #[case] framing: &'static str,
+    #[case] partial_upload: Vec<u8>,
+) {
+    let upstream = raw_upstream(|mut python: Raw| async move {
+        python.request_head().await.unwrap();
+        python
+            .send("HTTP/1.1 413 Payload Too Large\r\ncontent-type: application/json\r\ncontent-length: 26\r\nconnection: close\r\n\r\n{\"error\":\"file too large\"}")
+            .await;
+    })
+    .await;
+    let gateway = Gateway::start(upstream).await;
+    let mut raw = gateway.connect().await;
+
+    raw.send(format!(
+        "POST /v1/files HTTP/1.1\r\nhost: x\r\n{framing}\r\n"
+    ))
+    .await;
+    raw.send(partial_upload).await;
+
+    let head = within(raw.response_head()).await.unwrap();
+    assert_eq!(head.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        raw.body(head.content_length().unwrap()).await,
+        b"{\"error\":\"file too large\"}"
+    );
+}

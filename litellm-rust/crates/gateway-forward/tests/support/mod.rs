@@ -9,9 +9,10 @@ use axum::{
     Router,
     body::{Body, Bytes},
     extract::Request,
-    http::{HeaderMap, Method, StatusCode, Uri},
+    http::{HeaderMap, Method, StatusCode, Uri, Version},
 };
 use http_body_util::BodyExt;
+use hyper::body::Incoming;
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
@@ -94,6 +95,18 @@ pub async fn h2(gateway: &Gateway) -> hyper::client::conn::http2::SendRequest<Bo
             .unwrap();
     tokio::spawn(connection);
     sender
+}
+
+/// Sends `request` over a new client connection speaking `version`, HTTP/2 with prior knowledge.
+pub async fn send(
+    gateway: &Gateway,
+    version: Version,
+    request: Request,
+) -> axum::http::Response<Incoming> {
+    match version {
+        Version::HTTP_2 => h2(gateway).await.send_request(request).await.unwrap(),
+        _ => client().request(request).await.unwrap(),
+    }
 }
 
 /// What the upstream received, after the forwarder rewrote it.

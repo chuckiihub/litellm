@@ -80,6 +80,96 @@ async fn answers_expect_continue_so_large_uploads_start() {
     assert_eq!(received.recv().await.unwrap().body, "data");
 }
 
+/// curl sends `expect: 100-continue` for any body over 1 MiB and waits for the 100 before sending
+/// the multipart body, which must reach Python intact even where it looks like framing.
+#[rstest]
+#[tokio::test]
+async fn expect_continue_delivers_a_large_multipart_upload_byte_for_byte() {
+    let (upstream, mut received) = recording(ok).await;
+    let gateway = Gateway::start(upstream).await;
+    let boundary = "------------------------d74496d66958873e";
+    let audio: Vec<u8> = (0..3 * 1024 * 1024)
+        .map(|index: u32| (index.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .chain(*b"\r\n0\r\n\r\nPOST /smuggled HTTP/1.1\r\n\r\n--")
+        .collect();
+    let body = [
+        format!("--{boundary}\r\ncontent-disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; filename=\"a b.wav\"\r\ncontent-type: audio/wav\r\n\r\n").into_bytes(),
+        audio,
+        format!("\r\n--{boundary}--\r\n").into_bytes(),
+    ]
+    .concat();
+    let content_type = format!("multipart/form-data; boundary={boundary}");
+    let mut raw = gateway.connect().await;
+    raw.send(format!(
+        "POST /v1/audio/transcriptions HTTP/1.1\r\nhost: x\r\ncontent-type: {content_type}\r\nexpect: 100-continue\r\ncontent-length: {}\r\n\r\n",
+        body.len()
+    ))
+    .await;
+    assert_eq!(
+        within(raw.response_head()).await.unwrap().status,
+        StatusCode::CONTINUE
+    );
+    raw.send(&body).await;
+    assert_eq!(
+        within(raw.response_head()).await.unwrap().status,
+        StatusCode::OK
+    );
+    let request = received.recv().await.unwrap();
+    assert_eq!(request.headers["content-type"], content_type.as_str());
+    assert_eq!(request.body, body);
+}
+
+/// uvicorn sends 100 Continue only once the app reads the body, so a client Python rejects up
+/// front gets the rejection instead of an invitation to upload a body nobody reads.
+#[rstest]
+#[tokio::test]
+async fn expect_continue_is_answered_by_python_not_by_the_forwarder() {
+    let upstream = raw_upstream(|mut python| async move {
+        python.request_head().await.unwrap();
+        python
+            .send("HTTP/1.1 401 Unauthorized\r\ncontent-length: 2\r\n\r\n{}")
+            .await;
+        python.closed().await;
+    })
+    .await;
+    let gateway = Gateway::start(upstream).await;
+    let mut raw = gateway.connect().await;
+    raw.send("POST /v1/files HTTP/1.1\r\nhost: x\r\nexpect: 100-continue\r\ncontent-length: 1048577\r\n\r\n")
+        .await;
+    assert_eq!(
+        within(raw.response_head()).await.unwrap().status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// A route that starts streaming its response before reading the upload never sends 100 Continue,
+/// so the client sends its body after the response head and Python still reads it.
+#[rstest]
+#[tokio::test]
+async fn an_expected_body_still_reaches_python_after_it_starts_its_response() {
+    let upstream = raw_upstream(|mut python| async move {
+        python.request_head().await.unwrap();
+        python
+            .send("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n")
+            .await;
+        let body = python.body(7).await;
+        python
+            .send([&b"7\r\n"[..], &body, b"\r\n0\r\n\r\n"].concat())
+            .await;
+    })
+    .await;
+    let gateway = Gateway::start(upstream).await;
+    let mut raw = gateway.connect().await;
+    raw.send("POST /v1/audio/transcriptions HTTP/1.1\r\nhost: x\r\nexpect: 100-continue\r\ncontent-length: 7\r\n\r\n")
+        .await;
+    assert_eq!(
+        within(raw.response_head()).await.unwrap().status,
+        StatusCode::OK
+    );
+    raw.send("payload").await;
+    assert_eq!(within(raw.chunked_body()).await, b"payload");
+}
+
 #[rstest]
 #[case::get("GET")]
 #[case::delete("DELETE")]
@@ -116,8 +206,15 @@ async fn forwards_a_chunked_body_on_any_method(#[case] method: &str) {
     &[("content-length", "7")],
     "payload"
 )]
+#[case::chunk_extensions_and_trailers(
+    "transfer-encoding: chunked\r\n",
+    "4;name=\"v\"\r\nbody\r\n0\r\nx-checksum: 1\r\n\r\n",
+    &[("transfer-encoding", "chunked")],
+    "body"
+)]
 #[tokio::test]
 async fn a_body_reaches_python_with_the_framing_the_client_chose(
+    #[values("POST", "GET")] method: &str,
     #[case] framing: &str,
     #[case] wire_body: &str,
     #[case] python_framing: &[(&str, &str)],
@@ -127,7 +224,7 @@ async fn a_body_reaches_python_with_the_framing_the_client_chose(
     let gateway = Gateway::start(upstream).await;
     let mut raw = gateway.connect().await;
     raw.send(format!(
-        "POST /v1/files HTTP/1.1\r\nhost: x\r\n{framing}\r\n{wire_body}"
+        "{method} /v1/files HTTP/1.1\r\nhost: x\r\n{framing}\r\n{wire_body}"
     ))
     .await;
     assert_eq!(
@@ -146,6 +243,7 @@ async fn a_body_reaches_python_with_the_framing_the_client_chose(
                 .map(move |value| (name, value.to_str().unwrap()))
         })
         .collect();
+    assert_eq!(request.method, method);
     assert_eq!(forwarded, python_framing);
     assert_eq!(request.body, python_body);
 }

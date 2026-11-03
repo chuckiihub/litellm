@@ -8,10 +8,15 @@ use std::{
     time::Duration,
 };
 
-use axum::{body::Body, extract::Request, http::StatusCode};
+use axum::{
+    body::Body,
+    extract::Request,
+    http::{StatusCode, Version},
+};
 use http_body_util::BodyExt;
+use hyper::body::Incoming;
 use rstest::rstest;
-use support::{Gateway, client, raw_upstream, within};
+use support::{Gateway, client, h2, raw_upstream, send, within};
 use tokio::{
     io::AsyncWriteExt,
     sync::{Notify, mpsc},
@@ -21,43 +26,59 @@ fn chunk(bytes: &[u8]) -> Vec<u8> {
     [format!("{:x}\r\n", bytes.len()).as_bytes(), bytes, b"\r\n"].concat()
 }
 
+const EVENTS: [&str; 3] = ["data: 1\n\n", "data: 2\n\n", "data: [DONE]\n\n"];
+
 #[rstest]
 #[tokio::test]
-async fn each_event_reaches_the_client_before_python_produces_the_next() {
+async fn each_event_reaches_the_client_before_python_produces_the_next(
+    #[values(true, false)] chunked: bool,
+    #[values(Version::HTTP_11, Version::HTTP_2)] version: Version,
+) {
     let produce = Arc::new(Notify::new());
     let next = produce.clone();
     let upstream = raw_upstream(move |mut python| {
         let next = next.clone();
         async move {
             python.request_head().await.unwrap();
+            let framing = match chunked {
+                true => "transfer-encoding: chunked".to_owned(),
+                false => format!("content-length: {}", EVENTS.concat().len()),
+            };
             python
-                .send("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n")
+                .send(format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n{framing}\r\n\r\n"
+                ))
                 .await;
-            for event in ["data: 1\n\n", "data: 2\n\n", "data: [DONE]\n\n"] {
-                python.send(chunk(event.as_bytes())).await;
+            for event in EVENTS {
+                match chunked {
+                    true => python.send(chunk(event.as_bytes())).await,
+                    false => python.send(event).await,
+                }
                 next.notified().await;
             }
-            python.send("0\r\n\r\n").await;
+            if chunked {
+                python.send("0\r\n\r\n").await;
+            }
         }
     })
     .await;
     let gateway = Gateway::start(upstream).await;
-    let mut response = within(
-        client().request(
-            Request::post(gateway.url("/v1/chat/completions"))
-                .body(Body::from(r#"{"stream":true}"#))
-                .unwrap(),
-        ),
-    )
-    .await
-    .unwrap();
+    let mut response = within(send(
+        &gateway,
+        version,
+        Request::post(gateway.url("/v1/chat/completions"))
+            .body(Body::from(r#"{"stream":true}"#))
+            .unwrap(),
+    ))
+    .await;
 
-    for event in ["data: 1\n\n", "data: 2\n\n", "data: [DONE]\n\n"] {
+    for event in EVENTS {
         let frame = within(response.body_mut().frame()).await.unwrap().unwrap();
         assert_eq!(frame.into_data().unwrap(), event);
         produce.notify_one();
     }
-    assert!(within(response.body_mut().frame()).await.is_none());
+    let rest = within(response.into_body().collect()).await.unwrap();
+    assert!(rest.to_bytes().is_empty());
 }
 
 #[rstest]
@@ -125,23 +146,80 @@ async fn relays_a_body_delimited_by_the_upstream_closing() {
     assert_eq!(within(body).await.unwrap().to_bytes(), "until eof");
 }
 
+async fn drain(mut body: Incoming) -> (Vec<u8>, Result<(), hyper::Error>) {
+    let mut delivered = Vec::new();
+    loop {
+        match within(body.frame()).await {
+            None => return (delivered, Ok(())),
+            Some(Err(error)) => return (delivered, Err(error)),
+            Some(Ok(frame)) => delivered.extend_from_slice(&frame.into_data().unwrap()),
+        }
+    }
+}
+
 #[rstest]
+#[case::after_the_head("transfer-encoding: chunked", "", "")]
+#[case::between_events("transfer-encoding: chunked", "6\r\ndata: \r\n", "data: ")]
+#[case::mid_event("transfer-encoding: chunked", "a\r\ndata:", "data:")]
+#[case::short_of_its_content_length("content-length: 100", "data: 1\n\n", "data: 1\n\n")]
 #[tokio::test]
-async fn an_upstream_dying_mid_stream_fails_the_client_body_instead_of_ending_it() {
-    let upstream = raw_upstream(|mut python| async move {
+async fn an_upstream_dying_mid_stream_fails_the_client_body_instead_of_ending_it(
+    #[case] framing: &'static str,
+    #[case] sent: &'static str,
+    #[case] delivered: &'static str,
+    #[values(Version::HTTP_11, Version::HTTP_2)] version: Version,
+) {
+    let upstream = raw_upstream(move |mut python| async move {
         python.request_head().await.unwrap();
         python
-            .send("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n6\r\ndata: \r\n")
+            .send(format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n{framing}\r\n\r\n{sent}"
+            ))
             .await;
     })
     .await;
     let gateway = Gateway::start(upstream).await;
-    let response =
-        within(client().request(Request::get(gateway.url("/")).body(Body::empty()).unwrap()))
-            .await
-            .unwrap();
+    let response = within(send(
+        &gateway,
+        version,
+        Request::get(gateway.url("/")).body(Body::empty()).unwrap(),
+    ))
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(within(response.into_body().collect()).await.is_err());
+
+    let (received, ended) = drain(response.into_body()).await;
+    assert_eq!(received, delivered.as_bytes());
+    assert!(ended.is_err());
+}
+
+/// An HTTP/2 client multiplexes its other requests over the same connection, so a stream Python
+/// broke is reset on its own.
+#[rstest]
+#[tokio::test]
+async fn an_upstream_dying_mid_stream_resets_only_its_http2_stream() {
+    let upstream = raw_upstream(|mut python| async move {
+        let head = python.request_head().await.unwrap();
+        if head.path == "/next" {
+            python
+                .send("HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nnext")
+                .await;
+            return;
+        }
+        python
+            .send("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n6\r\ndata: \r\n")
+            .await;
+    })
+    .await;
+    let gateway = Gateway::start(upstream).await;
+    let mut sender = h2(&gateway).await;
+    let get = |path: &str| Request::get(gateway.url(path)).body(Body::empty()).unwrap();
+
+    let broken = within(sender.send_request(get("/"))).await.unwrap();
+    assert!(drain(broken.into_body()).await.1.is_err());
+
+    let next = within(sender.send_request(get("/next"))).await.unwrap();
+    let body = within(next.into_body().collect()).await.unwrap().to_bytes();
+    assert_eq!(body, "next");
 }
 
 #[rstest]

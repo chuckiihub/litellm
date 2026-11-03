@@ -8,12 +8,12 @@ use std::{
 use axum::{
     body::Body,
     extract::Request,
-    http::StatusCode,
+    http::{StatusCode, Version},
     response::{IntoResponse, Response},
 };
 use http_body_util::BodyExt;
 use rstest::rstest;
-use support::{Gateway, client, h2, raw_upstream, recording, within};
+use support::{Gateway, client, h2, raw_upstream, recording, send, within};
 use tokio::{sync::mpsc, time::Instant};
 
 const SSE_HEAD: &str = "HTTP/1.1 200 OK\r\n\
@@ -80,6 +80,40 @@ async fn an_idle_mcp_stream_stays_open_in_both_directions() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body, [PING, MESSAGE].concat());
     assert!(started.elapsed() >= idle);
+}
+
+/// HTTP/2 has no idle timer, so the gateway's pings run through every exchange, and a stream that
+/// goes quiet must outlive any number of pings its client answers.
+#[rstest]
+#[tokio::test]
+async fn an_idle_http2_stream_outlives_the_keepalive_pings_its_client_answers() {
+    let keepalive = Duration::from_millis(100);
+    let upstream = raw_upstream(move |mut python| async move {
+        python.request_head().await.unwrap();
+        python.send(SSE_HEAD).await;
+        tokio::time::sleep(keepalive * 10).await;
+        python.send(chunk(MESSAGE)).await;
+        python.send("0\r\n\r\n").await;
+    })
+    .await;
+    let gateway = Gateway::with_keepalive(upstream, keepalive).await;
+
+    let response = within(send(
+        &gateway,
+        Version::HTTP_2,
+        Request::get(gateway.url("/github/mcp"))
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap(),
+    ))
+    .await;
+
+    assert_eq!(response.headers()["mcp-session-id"], "session-1");
+    let body = within(response.into_body().collect())
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(body, MESSAGE);
 }
 
 /// A legacy MCP SSE client holds its GET stream on one HTTP/2 connection and POSTs the messages
