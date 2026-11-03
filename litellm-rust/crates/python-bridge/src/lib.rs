@@ -37,6 +37,10 @@ mod _native {
     #[pymodule_export]
     use crate::model_registry::bundled_model_cost_map;
     #[pymodule_export]
+    use crate::redis::auth_cache::{
+        NativeAuthCache, NativeAuthCacheError, NativeDeclaredAuthReads, NativeDeclaredAuthWrite,
+    };
+    #[pymodule_export]
     use crate::redis::native_redis_breaker_states;
     #[pymodule_export]
     use crate::redis::rate_limits::{NativeRateLimitPending, NativeRateLimits};
@@ -129,6 +133,10 @@ mod tests {
                 "ResponsesWebSocketConnection",
                 "NativeDiagnosticProcessor",
                 "NativeRequestRedis",
+                "NativeAuthCache",
+                "NativeAuthCacheError",
+                "NativeDeclaredAuthReads",
+                "NativeDeclaredAuthWrite",
                 "NativeRateLimits",
                 "NativeRateLimitPending",
                 "NativeDeclaredCooldowns",
