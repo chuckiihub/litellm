@@ -12,14 +12,18 @@ from typing import Final, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
+import uvicorn
 from uvicorn.importer import import_from_string
 from uvicorn.main import main as uvicorn_main
 
 from gateway.launch import GATEWAY_APP, main, pool_database_url, public_listener, uvicorn_argv
+from litellm.constants import GRACEFUL_SHUTDOWN_TEARDOWN_HEADROOM_SECONDS
 from litellm.proxy.db.db_url_settings import DatabaseURLSettings
 from litellm.proxy.db.pgbouncer import PGBOUNCER_POOLED_ENV_VAR, PgBouncerError, PgBouncerSettings
 from litellm.proxy.proxy_server import app as proxy_app
-from litellm.proxy.rust_gateway import Supervised
+from litellm.proxy.rust_forward.mode import Supervised, server_overrides
+from litellm.proxy.rust_forward.supervisor import rust_spec
+from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager
 
 DB_ENV: Final = {
     "DATABASE_HOST": "db.internal",
@@ -127,34 +131,59 @@ class TestUvicornArgv:
     @pytest.mark.parametrize(
         ("argv", "trust"),
         [
-            ((), {"_LITELLM_GATEWAY_PROXY_HEADERS": "true"}),
-            (
-                ("--forwarded-allow-ips", "10.0.0.5"),
-                {"_LITELLM_GATEWAY_PROXY_HEADERS": "true", "FORWARDED_ALLOW_IPS": "10.0.0.5"},
-            ),
-            (("--forwarded-allow-ips=*",), {"_LITELLM_GATEWAY_PROXY_HEADERS": "true", "FORWARDED_ALLOW_IPS": "*"}),
-            (("--no-proxy-headers",), {"_LITELLM_GATEWAY_PROXY_HEADERS": "false"}),
+            ((), (True, None)),
+            (("--forwarded-allow-ips", "10.0.0.5"), (True, "10.0.0.5")),
+            (("--forwarded-allow-ips=*",), (True, "*")),
+            (("--no-proxy-headers",), (False, None)),
         ],
     )
     def test_forwarding_carries_operator_proxy_header_options_to_the_child(
-        self, argv: tuple[str, ...], trust: dict[str, str]
+        self, argv: tuple[str, ...], trust: tuple[bool, str | None], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        assert public_listener(("--host", "0.0.0.0", "--port", "4000", *argv), "gateway") == (
-            "gateway",
-            "0.0.0.0",
-            4000,
-            trust,
-        )
+        monkeypatch.delenv("FORWARDED_ALLOW_IPS", raising=False)
+        binary, listener = public_listener(("--host", "0.0.0.0", "--port", "4000", *argv), "gateway")
+        assert (binary, listener.host, listener.port) == ("gateway", "0.0.0.0", 4000)
+        assert (listener.proxy_headers, listener.trusted_proxies) == trust
+
+    @pytest.mark.parametrize(
+        ("argv", "environ"),
+        [(("--timeout-keep-alive", "2"), {}), ((), {"KEEPALIVE_TIMEOUT": "7"}), ((), {})],
+    )
+    def test_rust_retires_connections_by_the_keepalive_uvicorn_runs_with(
+        self, argv: tuple[str, ...], environ: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("KEEPALIVE_TIMEOUT", raising=False)
+        for name, value in environ.items():
+            monkeypatch.setenv(name, value)
+        _, listener = public_listener(argv, "gateway")
+        sent: Final = rust_spec("gateway", 45555, listener, {}).env["LITELLM_FORWARD_UPSTREAM_KEEPALIVE"]
+        assert sent == str(_uvicorn_params(uvicorn_argv(argv, os.environ, None))["timeout_keep_alive"])
+
+    def test_without_a_keepalive_rust_follows_uvicorns_own_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("KEEPALIVE_TIMEOUT", raising=False)
+        _, listener = public_listener((), "gateway")
+        assert listener.keepalive_seconds == uvicorn.Config(app="", log_config=None).timeout_keep_alive
+
+    @pytest.mark.parametrize("argv", [(), ("--timeout-graceful-shutdown", "12")])
+    def test_rust_drains_for_pythons_graceful_timeout_plus_teardown(
+        self, argv: tuple[str, ...], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GRACEFUL_SHUTDOWN_TIMEOUT", "7.5")
+        _, listener = public_listener(argv, "gateway")
+        flag: Final = _uvicorn_params(uvicorn_argv(argv, {}, None))["timeout_graceful_shutdown"]
+        graceful: Final = GracefulShutdownManager.get_timeout() if flag is None else float(str(flag))
+        sent: Final = rust_spec("gateway", 45555, listener, {}).env["LITELLM_FORWARD_SHUTDOWN_DRAIN"]
+        assert float(sent) == graceful + GRACEFUL_SHUTDOWN_TEARDOWN_HEADROOM_SECONDS
 
     def test_supervised_listener_uses_the_inherited_loopback_socket(self):
-        supervised: Final = Supervised(17, "0.0.0.0", True, "127.0.0.1")
+        supervised: Final = server_overrides(Supervised(17, "0.0.0.0", True, "127.0.0.1"))
         params: Final = _uvicorn_params(uvicorn_argv(("--workers", "2"), {}, supervised))
         assert params["fd"] == 17
         assert params["workers"] == 2
 
     @pytest.mark.parametrize("argv", [(), ("--proxy-headers",), ("--forwarded-allow-ips=*",)])
     def test_private_hop_leaves_proxy_headers_to_the_app(self, argv: tuple[str, ...]):
-        params: Final = _uvicorn_params(uvicorn_argv(argv, {}, Supervised(17, "0.0.0.0", True, "*")))
+        params: Final = _uvicorn_params(uvicorn_argv(argv, {}, server_overrides(Supervised(17, "0.0.0.0", True, "*"))))
         assert params["proxy_headers"] is False
 
     def test_direct_listener_keeps_explicit_proxy_header_options(self):

@@ -36,6 +36,10 @@ from litellm.types.llms.base import LiteLLMBaseModel
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
+
+    from litellm.proxy.rust_forward.listener import PublicListener
+    from litellm.proxy.rust_forward.mode import ServerOverrides
+    from litellm.proxy.rust_forward.peer import ASGIApp
 else:
     FastAPI = Any
 
@@ -262,6 +266,7 @@ def _apply_config_logging_settings(litellm_settings: StartupOutputSettings | Non
 
 
 WORKER_APP: Final = "litellm_cli.main:proxy_worker_app"
+FORWARD_APP: Final = "litellm.proxy.rust_forward.asgi:app"
 WORKER_LOG_CONFIG_ENV: Final = "LITELLM_WORKER_LOG_CONFIG"
 _LOG_CONFIG: Final = TypeAdapter[str | Mapping[str, object]](str | Mapping[str, object])
 _LOG_CONFIG_FILE: Final = TypeAdapter[Mapping[str, object]](Mapping[str, object])
@@ -390,12 +395,12 @@ class ProxyInitializationHelpers:
             logging.config.fileConfig(log_config, disable_existing_loggers=False)
 
     @staticmethod
-    def child_process_uvicorn_overrides(log_config: object) -> Mapping[str, object]:
+    def child_process_uvicorn_overrides(log_config: object, app: str = WORKER_APP) -> Mapping[str, object]:
         if log_config is None:
-            return MappingProxyType({"app": WORKER_APP, "factory": True})
+            return MappingProxyType({"app": app, "factory": True})
         ProxyInitializationHelpers.apply_log_config(_LOG_CONFIG.validate_python(log_config))
         os.environ[WORKER_LOG_CONFIG_ENV] = json.dumps(log_config)
-        return MappingProxyType({"app": WORKER_APP, "factory": True, "log_config": None})
+        return MappingProxyType({"app": app, "factory": True, "log_config": None})
 
     @staticmethod
     def apply_worker_log_config(environ: Mapping[str, str]) -> None:
@@ -410,7 +415,7 @@ class ProxyInitializationHelpers:
         log_config: str | None = None,
         keepalive_timeout: int | None = None,
         timeout_worker_healthcheck: int | None = None,
-        listener_fd: int | None = None,
+        forwarded: "ServerOverrides | None" = None,
     ) -> dict:
         """
         Get the arguments for `uvicorn` worker
@@ -429,7 +434,16 @@ class ProxyInitializationHelpers:
             "port": port,
             "server_header": False,
             "timeout_graceful_shutdown": GracefulShutdownManager.get_timeout(),
-            **({"fd": listener_fd, "proxy_headers": False} if listener_fd is not None else {}),
+            **(
+                {}
+                if forwarded is None
+                else {
+                    "app": FORWARD_APP,
+                    "factory": True,
+                    "fd": forwarded.fd,
+                    "proxy_headers": forwarded.proxy_headers,
+                }
+            ),
         }
         if log_config is not None:
             print_startup_message(f"Using log_config: {log_config}")
@@ -677,13 +691,13 @@ class ProxyInitializationHelpers:
     def run_gunicorn_server(
         host: str,
         port: int,
-        app: FastAPI,
+        app: "ASGIApp",
         num_workers: int,
         ssl_certfile_path: str,
         ssl_keyfile_path: str,
         max_requests_before_restart: int | None = None,
         max_requests_before_restart_jitter: int | None = None,
-        listener_fd: int | None = None,
+        forwarded: "ServerOverrides | None" = None,
     ):
         """
         Run litellm with `gunicorn`
@@ -756,10 +770,10 @@ class ProxyInitializationHelpers:
         )
         graceful_shutdown_timeout: Final = GracefulShutdownManager.get_timeout()
         gunicorn_options: Final = {
-            "bind": f"fd://{listener_fd}" if listener_fd is not None else f"{host}:{port}",
+            "bind": f"{host}:{port}" if forwarded is None else f"fd://{forwarded.fd}",
             "workers": num_workers,  # default is 1
             "worker_class": build_graceful_shutdown_uvicorn_worker(
-                graceful_shutdown_timeout, proxy_headers=listener_fd is None
+                graceful_shutdown_timeout, proxy_headers=True if forwarded is None else forwarded.proxy_headers
             ),
             "graceful_timeout": math.ceil(graceful_shutdown_timeout) + GRACEFUL_SHUTDOWN_TEARDOWN_HEADROOM_SECONDS,
             "preload": True,  # Add the preload flag,
@@ -828,6 +842,34 @@ class ProxyInitializationHelpers:
             return s.connect_ex(("localhost", port)) == 0
 
     _is_port_in_use = is_port_in_use
+
+    @staticmethod
+    def public_listener(host: str, port: int, keepalive_timeout: int | None, run_gunicorn: bool) -> "PublicListener":
+        """``run_gunicorn_server`` never hands ``--keepalive_timeout`` to gunicorn, so its workers keep gunicorn's."""
+        from gunicorn.config import Config as GunicornConfig
+
+        from litellm.proxy.rust_forward.listener import (
+            PublicListener,
+            shutdown_drain_seconds,
+            uvicorn_default_keepalive,
+        )
+        from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager
+
+        keepalive: Final = (
+            TypeAdapter(int).validate_python(GunicornConfig().keepalive)
+            if run_gunicorn
+            else (uvicorn_default_keepalive() if keepalive_timeout is None else keepalive_timeout)
+        )
+        return PublicListener(
+            host=host,
+            port=random.randint(1024, 49152)
+            if port == 4000 and ProxyInitializationHelpers.is_port_in_use(port)
+            else port,
+            keepalive_seconds=keepalive,
+            shutdown_drain_seconds=shutdown_drain_seconds(GracefulShutdownManager.get_timeout()),
+            proxy_headers=True,
+            trusted_proxies=None,
+        )
 
     @staticmethod
     def get_loop_type():
@@ -1286,17 +1328,17 @@ def run_server(
         run_setup_wizard()
         return
 
-    from litellm.proxy.rust_gateway import Supervised, Supervisor, rust_gateway_mode
+    from litellm.proxy.rust_forward.mode import Supervised, Supervisor, rust_forward_mode, server_overrides
 
-    gateway_mode: Final = rust_gateway_mode(os.environ)
-    if isinstance(gateway_mode, Supervisor) and not any(
+    forward_mode: Final = rust_forward_mode(os.environ)
+    if isinstance(forward_mode, Supervisor) and not any(
         (version, validate_config, health, test, skip_server_startup, check_migrations_against_existing_data)
     ):
-        from litellm.proxy.rust_gateway import cli_command, gateway_binary, startup_error, supervise
+        from litellm.proxy.rust_forward.listener import StartupError, startup_check
+        from litellm.proxy.rust_forward.supervisor import cli_command, gateway_binary, supervise
 
-        binary: Final = gateway_binary(sysconfig.get_path("scripts"))
-        gateway_error: Final = startup_error(
-            binary,
+        binary: Final = startup_check(
+            gateway_binary(sysconfig.get_path("scripts")),
             {
                 "--ssl_keyfile_path": ssl_keyfile_path,
                 "--ssl_certfile_path": ssl_certfile_path,
@@ -1305,14 +1347,11 @@ def run_server(
                 "--run_granian": run_granian,
             },
         )
-        if gateway_error is not None:
-            raise click.ClickException(gateway_error)
-        assert binary is not None
-        public_port: Final = (
-            random.randint(1024, 49152) if port == 4000 and ProxyInitializationHelpers.is_port_in_use(port) else port
-        )
-        raise SystemExit(supervise(binary, cli_command(sys.argv[1:]), host, public_port, os.environ))
-    supervised: Final = gateway_mode if isinstance(gateway_mode, Supervised) else None
+        if isinstance(binary, StartupError):
+            raise click.ClickException(binary.reason)
+        listener: Final = ProxyInitializationHelpers.public_listener(host, port, keepalive_timeout, run_gunicorn)
+        raise SystemExit(supervise(binary, cli_command(sys.argv[1:]), listener, os.environ))
+    forwarded: Final = server_overrides(forward_mode) if isinstance(forward_mode, Supervised) else None
 
     args: Final = locals()
     try:
@@ -1763,7 +1802,7 @@ def run_server(
         if prometheus_metrics_port is not None and prometheus_multiproc_dir is not None:
             from litellm.proxy.prometheus_metrics_server import MetricsServerStartupError, start_metrics_server_process
 
-            metrics_bind_host: Final = supervised.metrics_host if supervised is not None else host
+            metrics_bind_host: Final = host if forwarded is None else forwarded.metrics_host
             try:
                 metrics_process: Final = start_metrics_server_process(
                     host=metrics_bind_host, port=prometheus_metrics_port, multiproc_dir=prometheus_multiproc_dir
@@ -1782,7 +1821,7 @@ def run_server(
             log_config=log_config,
             keepalive_timeout=keepalive_timeout,
             timeout_worker_healthcheck=(timeout_worker_healthcheck if running_uvicorn else None),
-            listener_fd=supervised.listener_fd if supervised is not None else None,
+            forwarded=forwarded,
         )
         # Optional: recycle uvicorn workers after N requests
         if max_requests_before_restart is not None:
@@ -1822,7 +1861,7 @@ def run_server(
                 start_query_engine_reaper()
             if num_workers > 1 or reload:
                 worker_overrides: Final = ProxyInitializationHelpers.child_process_uvicorn_overrides(
-                    uvicorn_args.get("log_config")
+                    uvicorn_args.get("log_config"), WORKER_APP if forwarded is None else FORWARD_APP
                 )
                 if reload and num_workers > 1:
                     from litellm.proxy.dev_reload import (
@@ -1848,16 +1887,18 @@ def run_server(
                 workers=num_workers,
             )
         elif run_gunicorn is True:
+            from litellm.proxy.rust_forward.peer import wrap
+
             ProxyInitializationHelpers.run_gunicorn_server(
                 host=host,
                 port=port,
-                app=app,
+                app=wrap(app, forward_mode),
                 num_workers=num_workers,
                 ssl_certfile_path=ssl_certfile_path,
                 ssl_keyfile_path=ssl_keyfile_path,
                 max_requests_before_restart=max_requests_before_restart,
                 max_requests_before_restart_jitter=max_requests_before_restart_jitter,
-                listener_fd=supervised.listener_fd if supervised is not None else None,
+                forwarded=forwarded,
             )
         elif run_hypercorn is True:
             ProxyInitializationHelpers.init_hypercorn_server(

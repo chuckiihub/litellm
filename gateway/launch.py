@@ -29,27 +29,29 @@ from uvicorn.main import main as uvicorn_main
 from litellm_cli.main import without_gc_pauses
 
 if TYPE_CHECKING:
-    from fastapi import FastAPI
-
     from litellm.proxy.db.db_url_settings import DatabaseURLSettings
     from litellm.proxy.db.pgbouncer import PgBouncerError, PgBouncerSettings
-    from litellm.proxy.rust_gateway import Supervised
+    from litellm.proxy.rust_forward.listener import PublicListener
+    from litellm.proxy.rust_forward.mode import ServerOverrides
+    from litellm.proxy.rust_forward.peer import ASGIApp
 
 GATEWAY_APP: Final = "gateway.launch:worker_app"
 KEEPALIVE_FLAG: Final = "--timeout-keep-alive"
 
 
-def uvicorn_argv(argv: Sequence[str], environ: Mapping[str, str], supervised: "Supervised | None") -> tuple[str, ...]:
+def uvicorn_argv(
+    argv: Sequence[str], environ: Mapping[str, str], forwarded: "ServerOverrides | None"
+) -> tuple[str, ...]:
     """Honor ``KEEPALIVE_TIMEOUT`` like ``proxy_cli.py`` does, unless the flag was passed explicitly."""
     keepalive: Final = environ.get("KEEPALIVE_TIMEOUT")
     inherited_socket: Final = (
-        (
+        ()
+        if forwarded is None
+        else (
             "--fd",
-            str(supervised.listener_fd),
-            "--no-proxy-headers",
+            str(forwarded.fd),
+            "--proxy-headers" if forwarded.proxy_headers else "--no-proxy-headers",
         )
-        if supervised is not None
-        else ()
     )
     if keepalive is None or any(arg == KEEPALIVE_FLAG or arg.startswith(f"{KEEPALIVE_FLAG}=") for arg in argv):
         return (GATEWAY_APP, "--factory", *argv, *inherited_socket)
@@ -77,26 +79,29 @@ def pool_database_url(
     return start_in_container_pgbouncer(pgbouncer, upstream_url, token_auth=settings.token_auth())
 
 
-def worker_app() -> "FastAPI":
+def worker_app() -> "ASGIApp":
     with without_gc_pauses():
         from gateway.main import app
-    return app
+        from litellm.proxy.rust_forward.mode import rust_forward_mode
+        from litellm.proxy.rust_forward.peer import wrap
+    return wrap(app, rust_forward_mode(os.environ))
 
 
 def _serve(argv: Sequence[str]) -> None:
     uvicorn_main(tuple(argv), prog_name="uvicorn")
 
 
-def public_listener(argv: Sequence[str], binary: str | None) -> tuple[str, str, int, Mapping[str, str]]:
-    """Validate the uvicorn flags for Rust forwarding and return the binary, public address and child environment."""
+def public_listener(argv: Sequence[str], binary: str | None) -> "tuple[str, PublicListener]":
+    """Validate the uvicorn flags for Rust forwarding and return the binary and the public listener."""
     from pydantic import TypeAdapter
 
-    from litellm.proxy.rust_gateway import PROXY_HEADERS, TRUSTED_PROXIES, startup_error
+    from litellm.proxy.rust_forward.listener import PublicListener, StartupError, shutdown_drain_seconds, startup_check
+    from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager
 
     params: Final[Mapping[str, object]] = uvicorn_main.make_context(
         "uvicorn", list(uvicorn_argv(argv, os.environ, None))
     ).params
-    error: Final = startup_error(
+    checked: Final = startup_check(
         binary,
         {
             "--ssl-keyfile": params["ssl_keyfile"],
@@ -106,18 +111,18 @@ def public_listener(argv: Sequence[str], binary: str | None) -> tuple[str, str, 
             "--fd": params["fd"] is not None,
         },
     )
-    if error is not None:
-        sys.exit(error)
-    assert binary is not None
-    host, port = TypeAdapter(tuple[str, int]).validate_python((params["host"], params["port"]))
-    operator_trust: Final = TypeAdapter(str | None).validate_python(params["forwarded_allow_ips"])
-    proxy_headers: Final = TypeAdapter(bool).validate_python(params["proxy_headers"])
-    return (
-        binary,
-        host,
-        port,
-        {PROXY_HEADERS: str(proxy_headers).lower()}
-        | ({} if operator_trust is None else {TRUSTED_PROXIES: operator_trust}),
+    if isinstance(checked, StartupError):
+        sys.exit(checked.reason)
+    graceful_timeout: Final = TypeAdapter[int | None](int | None).validate_python(params["timeout_graceful_shutdown"])
+    return checked, PublicListener(
+        host=TypeAdapter(str).validate_python(params["host"]),
+        port=TypeAdapter(int).validate_python(params["port"]),
+        keepalive_seconds=TypeAdapter(int).validate_python(params["timeout_keep_alive"]),
+        shutdown_drain_seconds=shutdown_drain_seconds(
+            GracefulShutdownManager.get_timeout() if graceful_timeout is None else graceful_timeout
+        ),
+        proxy_headers=TypeAdapter(bool).validate_python(params["proxy_headers"]),
+        trusted_proxies=TypeAdapter[str | None](str | None).validate_python(params["forwarded_allow_ips"]),
     )
 
 
@@ -135,27 +140,21 @@ def configure_database() -> None:
 
 
 def main(argv: Sequence[str], serve: Callable[[Sequence[str]], None] = _serve) -> None:
-    from litellm.proxy.rust_gateway import (
-        Disabled,
-        Supervised,
-        Supervisor,
-        gateway_binary,
-        rust_gateway_mode,
-        supervise,
-    )
+    from litellm.proxy.rust_forward.mode import Disabled, Supervised, Supervisor, rust_forward_mode, server_overrides
+    from litellm.proxy.rust_forward.supervisor import gateway_binary, supervise
 
-    mode: Final = rust_gateway_mode(os.environ)
+    mode: Final = rust_forward_mode(os.environ)
     match mode:
         case Disabled():
             configure_database()
             serve(uvicorn_argv(argv, os.environ, None))
         case Supervisor():
-            binary, host, port, trust = public_listener(argv, gateway_binary(sysconfig.get_path("scripts")))
+            binary, listener = public_listener(argv, gateway_binary(sysconfig.get_path("scripts")))
             configure_database()
             command: Final = (sys.executable, "-m", "gateway.launch", *argv)
-            sys.exit(supervise(binary, command, host, port, {**os.environ, **trust}))
+            sys.exit(supervise(binary, command, listener, os.environ))
         case Supervised():
-            serve(uvicorn_argv(argv, os.environ, mode))
+            serve(uvicorn_argv(argv, os.environ, server_overrides(mode)))
         case _:
             assert_never(mode)
 
