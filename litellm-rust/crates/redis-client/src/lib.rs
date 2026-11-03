@@ -22,5 +22,6 @@ pub use namespace::Namespace;
 pub use pipeline::Pipeline;
 pub use redis::{
     BasicAuth, ErrorKind as RedisErrorKind, RedisError, StreamingCredentialsProvider, Value,
+    cluster_routing::Slot,
 };
 pub use script::Script;
