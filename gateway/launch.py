@@ -19,7 +19,6 @@ Run with:
 
 import os
 import sys
-import sysconfig
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Final
 
@@ -31,31 +30,19 @@ from litellm_cli.main import without_gc_pauses
 if TYPE_CHECKING:
     from litellm.proxy.db.db_url_settings import DatabaseURLSettings
     from litellm.proxy.db.pgbouncer import PgBouncerError, PgBouncerSettings
-    from litellm.proxy.rust_forward.listener import PublicListener
-    from litellm.proxy.rust_forward.mode import ServerOverrides
     from litellm.proxy.rust_forward.peer import ASGIApp
+    from litellm.proxy.rust_forward.server import PythonServer
 
 GATEWAY_APP: Final = "gateway.launch:worker_app"
 KEEPALIVE_FLAG: Final = "--timeout-keep-alive"
 
 
-def uvicorn_argv(
-    argv: Sequence[str], environ: Mapping[str, str], forwarded: "ServerOverrides | None"
-) -> tuple[str, ...]:
+def uvicorn_argv(argv: Sequence[str], environ: Mapping[str, str]) -> tuple[str, ...]:
     """Honor ``KEEPALIVE_TIMEOUT`` like ``proxy_cli.py`` does, unless the flag was passed explicitly."""
     keepalive: Final = environ.get("KEEPALIVE_TIMEOUT")
-    inherited_socket: Final = (
-        ()
-        if forwarded is None
-        else (
-            "--fd",
-            str(forwarded.fd),
-            "--proxy-headers" if forwarded.proxy_headers else "--no-proxy-headers",
-        )
-    )
     if keepalive is None or any(arg == KEEPALIVE_FLAG or arg.startswith(f"{KEEPALIVE_FLAG}=") for arg in argv):
-        return (GATEWAY_APP, "--factory", *argv, *inherited_socket)
-    return (GATEWAY_APP, "--factory", *argv, KEEPALIVE_FLAG, keepalive, *inherited_socket)
+        return (GATEWAY_APP, "--factory", *argv)
+    return (GATEWAY_APP, "--factory", *argv, KEEPALIVE_FLAG, keepalive)
 
 
 def pool_database_url(
@@ -91,36 +78,40 @@ def _serve(argv: Sequence[str]) -> None:
     uvicorn_main(tuple(argv), prog_name="uvicorn")
 
 
-def public_listener(argv: Sequence[str], binary: str | None) -> "tuple[str, PublicListener]":
-    """Validate the uvicorn flags for Rust forwarding and return the binary and the public listener."""
+def python_server(argv: Sequence[str]) -> "PythonServer":
+    """What uvicorn would serve the public port with, read from the same flags and environment it reads."""
     from pydantic import TypeAdapter
 
-    from litellm.proxy.rust_forward.listener import PublicListener, StartupError, shutdown_drain_seconds, startup_check
+    from litellm.proxy.rust_forward.server import Listener, PythonServer, Server
     from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager
 
     params: Final[Mapping[str, object]] = uvicorn_main.make_context(
-        "uvicorn", list(uvicorn_argv(argv, os.environ, None))
+        "uvicorn", list(uvicorn_argv(argv, os.environ))
     ).params
-    checked: Final = startup_check(
-        binary,
-        {
-            "--ssl-keyfile": params["ssl_keyfile"],
-            "--ssl-certfile": params["ssl_certfile"],
-            "--ssl-ciphers": any(arg.split("=")[0] == "--ssl-ciphers" for arg in argv),
-            "--uds": params["uds"] is not None,
-            "--fd": params["fd"] is not None,
-        },
+    tls: Final = (
+        params["ssl_keyfile"] is not None
+        or params["ssl_certfile"] is not None
+        or any(arg.split("=")[0] == "--ssl-ciphers" for arg in argv)
     )
-    if isinstance(checked, StartupError):
-        sys.exit(checked.reason)
+    listener: Final = (
+        Listener.TLS
+        if tls
+        else Listener.UNIX_SOCKET
+        if params["uds"] is not None
+        else Listener.INHERITED_FD
+        if params["fd"] is not None
+        else Listener.TCP
+    )
     graceful_timeout: Final = TypeAdapter[int | None](int | None).validate_python(params["timeout_graceful_shutdown"])
-    return checked, PublicListener(
+    return PythonServer(
+        server=Server.UVICORN,
+        listener=listener,
         host=TypeAdapter(str).validate_python(params["host"]),
         port=TypeAdapter(int).validate_python(params["port"]),
         keepalive_seconds=TypeAdapter(int).validate_python(params["timeout_keep_alive"]),
-        shutdown_drain_seconds=shutdown_drain_seconds(
-            GracefulShutdownManager.get_timeout() if graceful_timeout is None else graceful_timeout
-        ),
+        graceful_timeout_seconds=GracefulShutdownManager.get_timeout()
+        if graceful_timeout is None
+        else graceful_timeout,
         proxy_headers=TypeAdapter(bool).validate_python(params["proxy_headers"]),
         trusted_proxies=TypeAdapter[str | None](str | None).validate_python(params["forwarded_allow_ips"]),
     )
@@ -140,21 +131,19 @@ def configure_database() -> None:
 
 
 def main(argv: Sequence[str], serve: Callable[[Sequence[str]], None] = _serve) -> None:
-    from litellm.proxy.rust_forward.mode import Disabled, Supervised, Supervisor, rust_forward_mode, server_overrides
-    from litellm.proxy.rust_forward.supervisor import gateway_binary, supervise
+    from litellm.proxy.rust_forward.mode import Disabled, Supervised, Supervisor, rust_forward_mode, uvicorn_flags
+    from litellm.proxy.rust_forward.supervisor import supervise
 
     mode: Final = rust_forward_mode(os.environ)
     match mode:
         case Disabled():
             configure_database()
-            serve(uvicorn_argv(argv, os.environ, None))
+            serve(uvicorn_argv(argv, os.environ))
         case Supervisor():
-            binary, listener = public_listener(argv, gateway_binary(sysconfig.get_path("scripts")))
-            configure_database()
             command: Final = (sys.executable, "-m", "gateway.launch", *argv)
-            sys.exit(supervise(binary, command, listener, os.environ))
+            sys.exit(supervise(python_server(argv), command, os.environ, before_start=configure_database))
         case Supervised():
-            serve(uvicorn_argv(argv, os.environ, server_overrides(mode)))
+            serve((*uvicorn_argv(argv, os.environ), *uvicorn_flags(mode)))
         case _:
             assert_never(mode)
 

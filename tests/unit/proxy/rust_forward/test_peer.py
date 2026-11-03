@@ -79,10 +79,10 @@ FORWARDED: Final[Headers] = (
 @pytest.mark.parametrize(
     "mode",
     [
-        Supervised(17, "0.0.0.0", True, "127.0.0.1"),
-        Supervised(17, "0.0.0.0", True, "10.0.0.0/8"),
-        Supervised(17, "0.0.0.0", True, "*"),
-        Supervised(17, "0.0.0.0", False, "10.0.0.0/8"),
+        Supervised(17, True, "127.0.0.1"),
+        Supervised(17, True, "10.0.0.0/8"),
+        Supervised(17, True, "*"),
+        Supervised(17, False, "10.0.0.0/8"),
     ],
 )
 async def test_python_behind_rust_sees_what_a_direct_connection_would(
@@ -101,7 +101,7 @@ async def test_untrusted_peer_cannot_set_the_scheme_behind_rust() -> None:
         True,
         ("127.0.0.1", 60000),
         ((b"x-forwarded-proto", b"https"), (b"x-litellm-rust-peer", b"203.0.113.7:51234")),
-        Supervised(17, "0.0.0.0", True, "127.0.0.1"),
+        Supervised(17, True, "127.0.0.1"),
     )
     assert (client, scheme) == (("203.0.113.7", 51234), "http")
 
@@ -111,7 +111,7 @@ async def test_peer_header_from_anyone_but_the_rust_hop_is_dropped_and_ignored()
         True,
         ("192.0.2.9", 1000),
         ((b"x-litellm-rust-peer", b"10.0.12.34:1"),),
-        Supervised(17, "0.0.0.0", False, "127.0.0.1"),
+        Supervised(17, False, "127.0.0.1"),
     )
     assert (client, headers) == (("192.0.2.9", 1000), ())
 
@@ -121,12 +121,11 @@ async def _peer_probe(request: Request) -> dict[str, object]:
     return {"client": [request.client.host, request.client.port], "peer": request.headers.get("x-litellm-rust-peer")}
 
 
-@pytest.mark.parametrize("entry_point", ["litellm.proxy.rust_forward.asgi:app", "gateway.launch:worker_app"])
+@pytest.mark.parametrize("entry_point", ["litellm_cli.main:proxy_worker_app", "gateway.launch:worker_app"])
 async def test_every_entry_point_hands_routes_the_peer_rust_saw(
     entry_point: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("_LITELLM_GATEWAY_FD", "17")
-    monkeypatch.setenv("_LITELLM_GATEWAY_METRICS_HOST", "0.0.0.0")
     monkeypatch.setattr(proxy_app.router, "lifespan_context", proxy_app.router.lifespan_context)
     monkeypatch.setattr(
         proxy_app.router, "routes", [APIRoute("/__rust_forward_peer_probe", _peer_probe), *proxy_app.router.routes]

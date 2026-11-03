@@ -1,14 +1,14 @@
 import functools
 import signal
-import sys
 from pathlib import Path
 from typing import Final
 
 import pytest
 
+from litellm.constants import GRACEFUL_SHUTDOWN_TEARDOWN_HEADROOM_SECONDS
 from litellm.proxy.proxy_cli import run_server
-from litellm.proxy.rust_forward.listener import PublicListener
 from litellm.proxy.rust_forward.mode import Supervised, rust_forward_mode
+from litellm.proxy.rust_forward.server import Listener, PythonServer, Server
 from litellm.proxy.rust_forward.supervisor import (
     Child,
     Event,
@@ -17,55 +17,43 @@ from litellm.proxy.rust_forward.supervisor import (
     Finished,
     Running,
     Signal,
+    StartupError,
     State,
     Stop,
-    cli_command,
     gateway_binary,
     python_spec,
     rust_spec,
+    startup_check,
     step,
+    supervise,
 )
 
 TERM: Final = signal.SIGTERM
 INT: Final = signal.SIGINT
 
 
-def _listener(proxy_headers: bool = True, trusted_proxies: str | None = None) -> PublicListener:
-    return PublicListener("0.0.0.0", 4000, 5, 40.0, proxy_headers, trusted_proxies)
+def _server(
+    server: Server = Server.UVICORN, listener: Listener = Listener.TCP, trusted_proxies: str | None = None
+) -> PythonServer:
+    return PythonServer(server, listener, "0.0.0.0", 4000, 2, 2.5, False, trusted_proxies)
 
 
-@pytest.mark.parametrize(
-    ("environ", "listener", "expected"),
-    [
-        ({}, _listener(), Supervised(17, "0.0.0.0", True, "127.0.0.1")),
-        ({"FORWARDED_ALLOW_IPS": "10.0.0.5"}, _listener(), Supervised(17, "0.0.0.0", True, "10.0.0.5")),
-        ({"FORWARDED_ALLOW_IPS": "10.0.0.5"}, _listener(True, "*"), Supervised(17, "0.0.0.0", True, "*")),
-        ({}, _listener(False), Supervised(17, "0.0.0.0", False, "127.0.0.1")),
-    ],
-)
-def test_python_child_keeps_the_trust_python_alone_would_use(
-    environ: dict[str, str], listener: PublicListener, expected: Supervised
-) -> None:
-    spec: Final = python_spec(("python",), 17, 45555, listener, environ)
-    assert rust_forward_mode(spec.env) == expected
+def test_python_child_serves_the_private_socket_with_the_operators_trust() -> None:
+    spec: Final = python_spec(("python",), 17, 45555, _server(trusted_proxies="10.0.0.5"), {"KEEP": "1"})
+    assert rust_forward_mode(spec.env) == Supervised(17, False, "10.0.0.5")
+    assert (spec.env["KEEP"], spec.pass_fds) == ("1", (17,))
 
 
-def test_python_child_listens_privately_and_keeps_options() -> None:
+def test_python_child_keeps_the_public_host_and_its_options() -> None:
     arguments: Final = ("--host", "0.0.0.0", "--port", "4000", "--num_workers", "2", "--reload")
-    spec: Final = python_spec(arguments, 17, 45555, _listener(), {})
+    spec: Final = python_spec(arguments, 17, 45555, _server(), {})
     params: Final = run_server.make_context("litellm", list(spec.argv)).params
-    assert params["host"] == "127.0.0.1"
-    assert params["port"] == 45555
-    assert params["num_workers"] == 2
-    assert params["reload"] is True
-    assert spec.pass_fds == (17,)
-    assert cli_command(()) == (sys.executable, "-m", "litellm.proxy.proxy_cli")
+    assert (params["host"], params["port"]) == ("0.0.0.0", 45555)
+    assert (params["num_workers"], params["reload"]) == (2, True)
 
 
 def test_rust_child_serves_public_port_and_forwards_to_private_listener() -> None:
-    spec: Final = rust_spec(
-        "gateway", 45555, PublicListener("0.0.0.0", 4000, 2, 12.5, True, None), {"RUST_LOG": "info"}
-    )
+    spec: Final = rust_spec("gateway", 45555, _server(), {"RUST_LOG": "info"})
     assert spec.argv == ("gateway",)
     assert spec.pass_fds == ()
     assert dict(spec.env) == {
@@ -74,8 +62,41 @@ def test_rust_child_serves_public_port_and_forwards_to_private_listener() -> Non
         "LITELLM_FORWARD_HOST": "0.0.0.0",
         "LITELLM_FORWARD_PORT": "4000",
         "LITELLM_FORWARD_UPSTREAM_KEEPALIVE": "2",
-        "LITELLM_FORWARD_SHUTDOWN_DRAIN": "12.5",
+        "LITELLM_FORWARD_SHUTDOWN_DRAIN": str(2.5 + GRACEFUL_SHUTDOWN_TEARDOWN_HEADROOM_SECONDS),
     }
+
+
+@pytest.mark.parametrize(
+    ("server", "reason"),
+    [
+        (_server(Server.HYPERCORN), "LITELLM_RUST does not support Hypercorn"),
+        (_server(Server.GRANIAN), "LITELLM_RUST does not support Granian"),
+        (_server(listener=Listener.TLS), "LITELLM_RUST does not support TLS on the public port"),
+        (_server(listener=Listener.UNIX_SOCKET), "LITELLM_RUST does not support a Unix socket on the public port"),
+        (
+            _server(Server.GUNICORN, Listener.INHERITED_FD),
+            "LITELLM_RUST does not support an inherited file descriptor on the public port",
+        ),
+    ],
+)
+def test_unsupported_servers_are_refused_before_anything_starts(
+    server: PythonServer, reason: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert startup_check(server, "gateway") == StartupError(reason)
+    prepared: Final[list[bool]] = []
+    assert supervise(server, ("python",), {}, before_start=lambda: prepared.append(True)) == ExitCode.CHILD_FAILED
+    assert (capsys.readouterr().err, prepared) == (f"{reason}\n", [])
+
+
+@pytest.mark.parametrize("server", [Server.UVICORN, Server.GUNICORN])
+def test_plain_tcp_uvicorn_and_gunicorn_can_be_forwarded(server: Server) -> None:
+    assert startup_check(_server(server), "gateway") == "gateway"
+
+
+def test_missing_binary_gives_install_instruction() -> None:
+    assert startup_check(_server(), None) == StartupError(
+        "LITELLM_RUST requires the litellm-gateway binary. Install litellm[proxy] in this environment"
+    )
 
 
 def test_binary_is_found_only_in_the_environment_scripts_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

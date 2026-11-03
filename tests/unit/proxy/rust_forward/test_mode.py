@@ -1,9 +1,20 @@
 from typing import Final
 
 import pytest
+import uvicorn
 
-from litellm.proxy.proxy_cli import ProxyInitializationHelpers
-from litellm.proxy.rust_forward.mode import Disabled, Supervised, Supervisor, rust_forward_mode, server_overrides
+from litellm.proxy.proxy_cli import WORKER_APP, ProxyInitializationHelpers
+from litellm.proxy.rust_forward.mode import (
+    Disabled,
+    RustForwardMode,
+    Supervised,
+    Supervisor,
+    gunicorn_bind,
+    rust_forward_mode,
+    server_proxy_headers,
+    supervised_environment,
+    uvicorn_options,
+)
 
 
 @pytest.mark.parametrize(
@@ -20,24 +31,54 @@ from litellm.proxy.rust_forward.mode import Disabled, Supervised, Supervisor, ru
         ({"LITELLM_RUST": " 1 "}, Supervisor()),
         ({"LITELLM_RUST": "enabled"}, Disabled()),
         (
-            {
-                "LITELLM_RUST": "true",
-                "_LITELLM_GATEWAY_FD": "17",
-                "_LITELLM_GATEWAY_METRICS_HOST": "0.0.0.0",
-                "FORWARDED_ALLOW_IPS": "127.0.0.1,10.0.0.5",
-            },
-            Supervised(17, "0.0.0.0", True, "127.0.0.1,10.0.0.5"),
+            {"LITELLM_RUST": "true", "_LITELLM_GATEWAY_FD": "17", "FORWARDED_ALLOW_IPS": "127.0.0.1,10.0.0.5"},
+            Supervised(17, True, "127.0.0.1,10.0.0.5"),
         ),
     ],
 )
-def test_mode_is_resolved_from_environment(environ: dict[str, str], expected: object) -> None:
+def test_mode_is_resolved_from_environment(environ: dict[str, str], expected: RustForwardMode) -> None:
     assert rust_forward_mode(environ) == expected
 
 
-@pytest.mark.parametrize("mode", [None, Supervised(17, "0.0.0.0", True, "127.0.0.1")])
-def test_inherited_socket_reaches_uvicorn(mode: Supervised | None) -> None:
-    options: Final = ProxyInitializationHelpers.get_default_unvicorn_init_args(
-        "127.0.0.1", 45555, forwarded=None if mode is None else server_overrides(mode)
-    )
-    assert options.get("fd") == (None if mode is None else mode.listener_fd)
-    assert options.get("proxy_headers", True) is (mode is None)
+@pytest.mark.parametrize(
+    ("proxy_headers", "trusted_proxies", "inherited", "expected"),
+    [
+        (True, None, {}, Supervised(17, True, "127.0.0.1")),
+        (True, None, {"FORWARDED_ALLOW_IPS": "10.0.0.5"}, Supervised(17, True, "10.0.0.5")),
+        (True, "*", {"FORWARDED_ALLOW_IPS": "10.0.0.5"}, Supervised(17, True, "*")),
+        (False, None, {}, Supervised(17, False, "127.0.0.1")),
+    ],
+)
+def test_child_reads_back_the_trust_the_supervisor_wrote(
+    proxy_headers: bool, trusted_proxies: str | None, inherited: dict[str, str], expected: Supervised
+) -> None:
+    written: Final = supervised_environment(17, proxy_headers, trusted_proxies)
+    assert rust_forward_mode({**inherited, **written}) == expected
+
+
+def _served_uvicorn_config(mode: RustForwardMode) -> uvicorn.Config:
+    options: Final = {
+        **ProxyInitializationHelpers.get_default_unvicorn_init_args("0.0.0.0", 45555),
+        **uvicorn_options(mode, WORKER_APP),
+    }
+    return uvicorn.Config(**options)
+
+
+def test_supervised_uvicorn_serves_the_inherited_socket_without_trusting_the_rust_hop() -> None:
+    config: Final = _served_uvicorn_config(Supervised(17, True, "*"))
+    assert (config.fd, config.proxy_headers) == (17, False)
+    assert (config.app, config.factory) == (WORKER_APP, True)
+
+
+@pytest.mark.parametrize("mode", [Disabled(), Supervisor()])
+def test_unsupervised_servers_keep_their_own_socket_and_proxy_headers(mode: RustForwardMode) -> None:
+    config: Final = _served_uvicorn_config(mode)
+    assert (config.fd, config.proxy_headers, config.port) == (None, True, 45555)
+    assert gunicorn_bind(mode, "0.0.0.0:4000") == "0.0.0.0:4000"
+    assert server_proxy_headers(mode) is True
+
+
+def test_supervised_gunicorn_binds_the_inherited_socket_without_trusting_the_rust_hop() -> None:
+    mode: Final = Supervised(17, True, "*")
+    assert gunicorn_bind(mode, "0.0.0.0:4000") == "fd://17"
+    assert server_proxy_headers(mode) is False

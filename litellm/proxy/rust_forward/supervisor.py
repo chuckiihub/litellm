@@ -5,7 +5,8 @@ import shutil
 import signal
 import socket
 import sys
-from collections.abc import Mapping, Sequence
+import sysconfig
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from types import MappingProxyType
@@ -14,8 +15,10 @@ from typing import Final, TypeAlias
 from pydantic import TypeAdapter
 from typing_extensions import assert_never
 
-from litellm.proxy.rust_forward.listener import PublicListener
-from litellm.proxy.rust_forward.mode import GATEWAY_FD, METRICS_HOST, PROXY_HEADERS, RUST_HOP, TRUSTED_PROXIES
+from litellm.constants import GRACEFUL_SHUTDOWN_TEARDOWN_HEADROOM_SECONDS
+from litellm.proxy.rust_forward.mode import RUST_HOP, supervised_environment
+from litellm.proxy.rust_forward.server import Listener, PythonServer, Server
+from litellm.rust_bridge.configuration import ENV_NAME
 
 _ADDRESS: Final = TypeAdapter(tuple[str, int])
 
@@ -23,6 +26,25 @@ _ADDRESS: Final = TypeAdapter(tuple[str, int])
 def gateway_binary(scripts_dir: str) -> str | None:
     name: Final = "litellm-gateway.exe" if os.name == "nt" else "litellm-gateway"
     return shutil.which(name, path=scripts_dir)
+
+
+@dataclass(frozen=True, slots=True)
+class StartupError:
+    reason: str
+
+
+def startup_check(server: PythonServer, binary: str | None) -> str | StartupError:
+    if server.server in (Server.HYPERCORN, Server.GRANIAN):
+        return StartupError(f"{ENV_NAME} does not support {server.server.value}")
+    if server.listener is not Listener.TCP:
+        return StartupError(f"{ENV_NAME} does not support {server.listener.value} on the public port")
+    if os.name != "posix":
+        return StartupError(f"{ENV_NAME} requires POSIX inherited sockets and process signals")
+    if binary is None:
+        return StartupError(
+            f"{ENV_NAME} requires the litellm-gateway binary. Install litellm[proxy] in this environment"
+        )
+    return binary
 
 
 class Child(Enum):
@@ -116,34 +138,30 @@ class ChildSpec:
 
 
 def python_spec(
-    command: Sequence[str], listener_fd: int, upstream_port: int, listener: PublicListener, environ: Mapping[str, str]
+    command: Sequence[str], listener_fd: int, upstream_port: int, server: PythonServer, environ: Mapping[str, str]
 ) -> ChildSpec:
     return ChildSpec(
-        argv=(*command, "--host", RUST_HOP, "--port", str(upstream_port)),
+        argv=(*command, "--port", str(upstream_port)),
         env=MappingProxyType(
-            {
-                **environ,
-                GATEWAY_FD: str(listener_fd),
-                METRICS_HOST: listener.host,
-                PROXY_HEADERS: str(listener.proxy_headers).lower(),
-                **({} if listener.trusted_proxies is None else {TRUSTED_PROXIES: listener.trusted_proxies}),
-            }
+            {**environ, **supervised_environment(listener_fd, server.proxy_headers, server.trusted_proxies)}
         ),
         pass_fds=(listener_fd,),
     )
 
 
-def rust_spec(binary: str, upstream_port: int, listener: PublicListener, environ: Mapping[str, str]) -> ChildSpec:
+def rust_spec(binary: str, upstream_port: int, server: PythonServer, environ: Mapping[str, str]) -> ChildSpec:
     return ChildSpec(
         argv=(binary,),
         env=MappingProxyType(
             {
                 **environ,
                 "LITELLM_FORWARD_UPSTREAM": f"http://{RUST_HOP}:{upstream_port}",
-                "LITELLM_FORWARD_HOST": listener.host,
-                "LITELLM_FORWARD_PORT": str(listener.port),
-                "LITELLM_FORWARD_UPSTREAM_KEEPALIVE": str(listener.keepalive_seconds),
-                "LITELLM_FORWARD_SHUTDOWN_DRAIN": str(listener.shutdown_drain_seconds),
+                "LITELLM_FORWARD_HOST": server.host,
+                "LITELLM_FORWARD_PORT": str(server.port),
+                "LITELLM_FORWARD_UPSTREAM_KEEPALIVE": str(server.keepalive_seconds),
+                "LITELLM_FORWARD_SHUTDOWN_DRAIN": str(
+                    server.graceful_timeout_seconds + GRACEFUL_SHUTDOWN_TEARDOWN_HEADROOM_SECONDS
+                ),
             }
         ),
         pass_fds=(),
@@ -177,9 +195,7 @@ async def _drive(
     return await _drive(following, events, children)
 
 
-async def _supervise(
-    binary: str, command: Sequence[str], listener: PublicListener, environ: Mapping[str, str]
-) -> ExitCode:
+async def _supervise(binary: str, command: Sequence[str], server: PythonServer, environ: Mapping[str, str]) -> ExitCode:
     loop: Final = asyncio.get_running_loop()
     events: Final[asyncio.Queue[Event]] = asyncio.Queue()
     for signum in (signal.SIGTERM, signal.SIGINT):
@@ -188,9 +204,9 @@ async def _supervise(
         private.bind((RUST_HOP, 0))
         private.listen()
         _, upstream_port = _ADDRESS.validate_python(private.getsockname())
-        python: Final = await _spawn(python_spec(command, private.fileno(), upstream_port, listener, environ))
+        python: Final = await _spawn(python_spec(command, private.fileno(), upstream_port, server, environ))
         try:
-            rust: Final = await _spawn(rust_spec(binary, upstream_port, listener, environ))
+            rust: Final = await _spawn(rust_spec(binary, upstream_port, server, environ))
         except OSError:
             _terminate_group(python)
             await python.wait()
@@ -207,13 +223,27 @@ async def _supervise(
         await asyncio.gather(*waiters)
 
 
-def supervise(binary: str, command: Sequence[str], listener: PublicListener, environ: Mapping[str, str]) -> int:
+def _nothing_to_prepare() -> None:
+    pass
+
+
+def supervise(
+    server: PythonServer,
+    command: Sequence[str],
+    environ: Mapping[str, str],
+    before_start: Callable[[], None] = _nothing_to_prepare,
+) -> int:
+    """Serve ``server``'s public port from Rust and run ``command`` behind it, or say why that cannot start.
+
+    ``before_start`` runs only once forwarding is known to be possible, so a refused start leaves nothing behind.
+    """
+    checked: Final = startup_check(server, gateway_binary(sysconfig.get_path("scripts")))
+    if isinstance(checked, StartupError):
+        sys.stderr.write(f"{checked.reason}\n")
+        return ExitCode.CHILD_FAILED
+    before_start()
     try:
-        return asyncio.run(_supervise(binary, command, listener, environ))
+        return asyncio.run(_supervise(checked, command, server, environ))
     except OSError as error:
         sys.stderr.write(f"Rust gateway startup failed: {error}\n")
         return ExitCode.CHILD_FAILED
-
-
-def cli_command(argv: Sequence[str]) -> tuple[str, ...]:
-    return (sys.executable, "-m", "litellm.proxy.proxy_cli", *argv)

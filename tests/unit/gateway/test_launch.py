@@ -16,13 +16,12 @@ import uvicorn
 from uvicorn.importer import import_from_string
 from uvicorn.main import main as uvicorn_main
 
-from gateway.launch import GATEWAY_APP, main, pool_database_url, public_listener, uvicorn_argv
-from litellm.constants import GRACEFUL_SHUTDOWN_TEARDOWN_HEADROOM_SECONDS
+from gateway.launch import GATEWAY_APP, main, pool_database_url, python_server, uvicorn_argv
 from litellm.proxy.db.db_url_settings import DatabaseURLSettings
 from litellm.proxy.db.pgbouncer import PGBOUNCER_POOLED_ENV_VAR, PgBouncerError, PgBouncerSettings
 from litellm.proxy.proxy_server import app as proxy_app
-from litellm.proxy.rust_forward.mode import Supervised, server_overrides
-from litellm.proxy.rust_forward.supervisor import rust_spec
+from litellm.proxy.rust_forward.mode import Supervised, uvicorn_flags
+from litellm.proxy.rust_forward.server import Listener
 from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager
 
 DB_ENV: Final = {
@@ -120,13 +119,32 @@ def _uvicorn_params(argv: tuple[str, ...]) -> dict[str, object]:
 
 class TestUvicornArgv:
     @pytest.mark.parametrize(
-        "arguments", [("--uds", "/tmp/gateway.sock"), ("--fd", "0"), ("--fd=17",), ("--ssl-keyfile", "unused")]
+        ("arguments", "listener"),
+        [
+            ((), Listener.TCP),
+            (("--uds", "/tmp/gateway.sock"), Listener.UNIX_SOCKET),
+            (("--fd", "0"), Listener.INHERITED_FD),
+            (("--fd=17",), Listener.INHERITED_FD),
+            (("--ssl-keyfile", "unused"), Listener.TLS),
+            (("--ssl-ciphers", "TLSv1.2"), Listener.TLS),
+        ],
     )
-    def test_forwarding_rejects_unsupported_listeners_before_starting_processes(
-        self, arguments: tuple[str, ...]
+    def test_forwarding_sees_the_public_listener_uvicorn_would_open(
+        self, arguments: tuple[str, ...], listener: Listener
     ) -> None:
-        with pytest.raises(SystemExit, match=f"does not support {arguments[0].split('=')[0]}"):
-            public_listener(arguments, "gateway")
+        assert python_server(arguments).listener is listener
+
+    def test_an_unsupported_listener_stops_forwarding_before_the_database_is_prepared(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("LITELLM_RUST", "true")
+        monkeypatch.delenv("_LITELLM_GATEWAY_FD", raising=False)
+        monkeypatch.setenv("LITELLM_PGBOUNCER_ENABLED", "true")
+        monkeypatch.setenv("LITELLM_PGBOUNCER_BINARY", "/nonexistent/pgbouncer")
+        with pytest.raises(SystemExit) as stopped:
+            main(("--uds", "/tmp/gateway.sock"), serve=lambda argv: None)
+        assert stopped.value.code == 1
+        assert capsys.readouterr().err == "LITELLM_RUST does not support a Unix socket on the public port\n"
 
     @pytest.mark.parametrize(
         ("argv", "trust"),
@@ -141,9 +159,9 @@ class TestUvicornArgv:
         self, argv: tuple[str, ...], trust: tuple[bool, str | None], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv("FORWARDED_ALLOW_IPS", raising=False)
-        binary, listener = public_listener(("--host", "0.0.0.0", "--port", "4000", *argv), "gateway")
-        assert (binary, listener.host, listener.port) == ("gateway", "0.0.0.0", 4000)
-        assert (listener.proxy_headers, listener.trusted_proxies) == trust
+        server: Final = python_server(("--host", "0.0.0.0", "--port", "4000", *argv))
+        assert (server.host, server.port) == ("0.0.0.0", 4000)
+        assert (server.proxy_headers, server.trusted_proxies) == trust
 
     @pytest.mark.parametrize(
         ("argv", "environ"),
@@ -155,53 +173,49 @@ class TestUvicornArgv:
         monkeypatch.delenv("KEEPALIVE_TIMEOUT", raising=False)
         for name, value in environ.items():
             monkeypatch.setenv(name, value)
-        _, listener = public_listener(argv, "gateway")
-        sent: Final = rust_spec("gateway", 45555, listener, {}).env["LITELLM_FORWARD_UPSTREAM_KEEPALIVE"]
-        assert sent == str(_uvicorn_params(uvicorn_argv(argv, os.environ, None))["timeout_keep_alive"])
+        served: Final = _uvicorn_params(uvicorn_argv(argv, os.environ))["timeout_keep_alive"]
+        assert python_server(argv).keepalive_seconds == served
 
     def test_without_a_keepalive_rust_follows_uvicorns_own_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("KEEPALIVE_TIMEOUT", raising=False)
-        _, listener = public_listener((), "gateway")
-        assert listener.keepalive_seconds == uvicorn.Config(app="", log_config=None).timeout_keep_alive
+        assert python_server(()).keepalive_seconds == uvicorn.Config(app="", log_config=None).timeout_keep_alive
 
     @pytest.mark.parametrize("argv", [(), ("--timeout-graceful-shutdown", "12")])
     def test_rust_drains_for_pythons_graceful_timeout_plus_teardown(
         self, argv: tuple[str, ...], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("GRACEFUL_SHUTDOWN_TIMEOUT", "7.5")
-        _, listener = public_listener(argv, "gateway")
-        flag: Final = _uvicorn_params(uvicorn_argv(argv, {}, None))["timeout_graceful_shutdown"]
+        flag: Final = _uvicorn_params(uvicorn_argv(argv, {}))["timeout_graceful_shutdown"]
         graceful: Final = GracefulShutdownManager.get_timeout() if flag is None else float(str(flag))
-        sent: Final = rust_spec("gateway", 45555, listener, {}).env["LITELLM_FORWARD_SHUTDOWN_DRAIN"]
-        assert float(sent) == graceful + GRACEFUL_SHUTDOWN_TEARDOWN_HEADROOM_SECONDS
+        assert python_server(argv).graceful_timeout_seconds == graceful
 
     def test_supervised_listener_uses_the_inherited_loopback_socket(self):
-        supervised: Final = server_overrides(Supervised(17, "0.0.0.0", True, "127.0.0.1"))
-        params: Final = _uvicorn_params(uvicorn_argv(("--workers", "2"), {}, supervised))
+        supervised: Final = uvicorn_flags(Supervised(17, True, "127.0.0.1"))
+        params: Final = _uvicorn_params((*uvicorn_argv(("--workers", "2"), {}), *supervised))
         assert params["fd"] == 17
         assert params["workers"] == 2
 
     @pytest.mark.parametrize("argv", [(), ("--proxy-headers",), ("--forwarded-allow-ips=*",)])
     def test_private_hop_leaves_proxy_headers_to_the_app(self, argv: tuple[str, ...]):
-        params: Final = _uvicorn_params(uvicorn_argv(argv, {}, server_overrides(Supervised(17, "0.0.0.0", True, "*"))))
+        params: Final = _uvicorn_params((*uvicorn_argv(argv, {}), *uvicorn_flags(Supervised(17, True, "*"))))
         assert params["proxy_headers"] is False
 
     def test_direct_listener_keeps_explicit_proxy_header_options(self):
-        params: Final = _uvicorn_params(uvicorn_argv(("--no-proxy-headers", "--forwarded-allow-ips=*"), {}, None))
+        params: Final = _uvicorn_params(uvicorn_argv(("--no-proxy-headers", "--forwarded-allow-ips=*"), {}))
         assert params["proxy_headers"] is False
         assert params["forwarded_allow_ips"] == "*"
 
     def test_keepalive_env_reaches_uvicorn(self):
-        params: Final = _uvicorn_params(uvicorn_argv(("--workers", "4"), {"KEEPALIVE_TIMEOUT": "75"}, None))
+        params: Final = _uvicorn_params(uvicorn_argv(("--workers", "4"), {"KEEPALIVE_TIMEOUT": "75"}))
         assert params["app"] == GATEWAY_APP
         assert params["workers"] == 4
         assert params["timeout_keep_alive"] == 75
 
     def test_unset_env_keeps_the_uvicorn_default(self):
-        assert _uvicorn_params(uvicorn_argv(("--workers", "4"), {}, None))["timeout_keep_alive"] == 5
+        assert _uvicorn_params(uvicorn_argv(("--workers", "4"), {}))["timeout_keep_alive"] == 5
 
     def test_an_explicit_flag_wins_over_the_env(self):
-        argv: Final = uvicorn_argv(("--timeout-keep-alive", "30"), {"KEEPALIVE_TIMEOUT": "75"}, None)
+        argv: Final = uvicorn_argv(("--timeout-keep-alive", "30"), {"KEEPALIVE_TIMEOUT": "75"})
         assert _uvicorn_params(argv)["timeout_keep_alive"] == 30
 
     def test_the_app_uvicorn_is_told_to_serve_is_the_trimmed_gateway(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -218,7 +232,7 @@ class TestUvicornArgv:
         ):
             monkeypatch.delenv(key, raising=False)
 
-        params: Final = _uvicorn_params(uvicorn_argv((), {}, None))
+        params: Final = _uvicorn_params(uvicorn_argv((), {}))
         assert params["factory"] is True
         try:
             served: Final = import_from_string(cast(str, params["app"]))()
